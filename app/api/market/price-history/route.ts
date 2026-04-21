@@ -1,10 +1,14 @@
 import { PublicKey } from "@solana/web3.js";
 import { NextResponse } from "next/server";
 
+import { logChartPersist } from "@/lib/market/chart-persist-log";
+import { logChartSnapshot } from "@/lib/market/chart-snapshot-log";
 import {
   fetchMarketPriceHistoryPoints,
+  fetchMarketPriceHistoryPointsAfter,
   recordMarketPriceSnapshotFromChain,
 } from "@/lib/market/market-price-history";
+import { seedMarketPriceHistoryIfEmpty } from "@/lib/market/seed-market-price-history";
 import { getConnection } from "@/lib/solana/connection";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 
@@ -12,6 +16,7 @@ export const dynamic = "force-dynamic";
 
 /**
  * GET ?slug= — ordered probability history for the chart (no synthetic fill).
+ * GET ?slug=&sinceTs= — rows with snapshot_ts strictly after `sinceTs` (epoch ms); `mode: "incremental"`.
  */
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -20,8 +25,35 @@ export async function GET(req: Request) {
     return NextResponse.json({ error: "Missing slug" }, { status: 400 });
   }
 
-  const points = await fetchMarketPriceHistoryPoints(slug);
-  return NextResponse.json({ points });
+  const sinceRaw = searchParams.get("sinceTs")?.trim();
+  const sinceMs =
+    sinceRaw != null && sinceRaw !== "" ? Number(sinceRaw) : Number.NaN;
+
+  logChartSnapshot("api_enter", {
+    method: "GET",
+    slug,
+    sinceTs: Number.isFinite(sinceMs) ? sinceMs : null,
+  });
+
+  if (Number.isFinite(sinceMs)) {
+    const points = await fetchMarketPriceHistoryPointsAfter(slug, sinceMs);
+    return NextResponse.json({
+      points,
+      mode: "incremental" as const,
+    });
+  }
+
+  let points = await fetchMarketPriceHistoryPoints(slug);
+  if (points.length === 0) {
+    const repair = await seedMarketPriceHistoryIfEmpty(slug);
+    if (repair.ok && repair.seeded) {
+      points = await fetchMarketPriceHistoryPoints(slug);
+    }
+  }
+  return NextResponse.json({
+    points,
+    mode: "full" as const,
+  });
 }
 
 /**
@@ -44,6 +76,17 @@ export async function POST(req: Request) {
     );
   }
 
+  console.info("[predicted][buy-volume-trace] api_enter", {
+    step: "post_body_ok",
+    slug,
+    txSignature,
+  });
+  logChartSnapshot("api_enter", {
+    method: "POST",
+    slug,
+    txSignature,
+  });
+
   const sb = getSupabaseAdmin();
   if (!sb) {
     return NextResponse.json(
@@ -60,11 +103,27 @@ export async function POST(req: Request) {
     .maybeSingle();
 
   if (error || !row?.pool_address || !row.yes_mint || !row.no_mint) {
+    console.warn("[predicted][buy-volume-trace] api_enter", {
+      slug,
+      txSignature,
+      error: error?.message ?? "no_row",
+    });
     return NextResponse.json(
       { error: "Market not found or pool not ready" },
       { status: 404 },
     );
   }
+
+  console.info("[predicted][buy-volume-trace] api_enter", {
+    slug,
+    txSignature,
+    marketRowId: row.id,
+  });
+  logChartPersist("market_lookup_ok", {
+    slug,
+    marketRowId: row.id,
+    txSignature,
+  });
 
   let pairAddress: PublicKey;
   let yesMint: PublicKey;
@@ -78,6 +137,14 @@ export async function POST(req: Request) {
   }
 
   const connection = getConnection();
+  if (process.env.NODE_ENV === "development") {
+    console.info("[predicted][volume-verify] trade_snapshot_post", {
+      slug,
+      marketRowId: row.id,
+      txSignature,
+    });
+  }
+
   const result = await recordMarketPriceSnapshotFromChain({
     marketId: row.id,
     txSignature,
@@ -88,8 +155,25 @@ export async function POST(req: Request) {
   });
 
   if (!result.ok) {
+    console.warn("[predicted][buy-volume-trace] api_enter", {
+      slug,
+      txSignature,
+      marketRowId: row.id,
+      recordError: result.error,
+    });
     return NextResponse.json({ error: result.error }, { status: 502 });
   }
 
-  return NextResponse.json({ ok: true });
+  if (process.env.NODE_ENV === "development") {
+    console.info("[predicted][volume-verify] trade_snapshot_ok", {
+      slug,
+      tx: txSignature,
+      volumeVerify: result.volumeVerify,
+    });
+  }
+
+  return NextResponse.json({
+    ok: true,
+    volumeVerify: result.volumeVerify,
+  });
 }

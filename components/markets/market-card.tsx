@@ -2,16 +2,37 @@
 
 import Image from "next/image";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useEffect, useRef } from "react";
 import type { Market } from "@/lib/types/market";
-import { AnimatedVolume } from "@/components/markets/animated-volume";
+import { fmtUsdCompactVol } from "@/components/markets/animated-volume";
 import { FEED_TILE_CLASS } from "@/lib/constants/feed-layout";
 import { cn } from "@/lib/utils/cn";
 
 function CardMeta({ market }: { market: Market }) {
+  const incoming = market.snapshot?.volumeUsd;
+  const vol =
+    typeof incoming === "number" && Number.isFinite(incoming)
+      ? Math.max(0, incoming)
+      : 0;
+  const renderedText = `${fmtUsdCompactVol(vol)} vol`;
+
+  const volumeUiPrev = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    console.info("[predicted][volume-ui-refresh]", {
+      component: "MarketCard.CardMeta",
+      marketSlug: market.id,
+      volumeBefore: volumeUiPrev.current,
+      volumeAfter: vol,
+    });
+    volumeUiPrev.current = vol;
+  }, [market.id, vol]);
+
   return (
-    <div className="flex shrink-0 items-center border-t border-white/[0.04] px-2.5 py-2 text-[10px] text-zinc-500 sm:px-3 sm:text-[11px]">
-      <span className="min-w-0 truncate">
-        <AnimatedVolume value={market.snapshot.volumeUsd} />
+    <div className="flex shrink-0 items-center border-t border-white/[0.04] px-2.5 py-2 text-[10px] text-zinc-400 sm:px-3 sm:text-[11px]">
+      <span className="min-w-0 truncate tabular-nums text-zinc-300">
+        {renderedText}
       </span>
     </div>
   );
@@ -243,10 +264,34 @@ type MarketCardProps = {
 };
 
 export function MarketCard({ market }: MarketCardProps) {
+  const router = useRouter();
+  const href = `/markets/${encodeURIComponent(market.id)}`;
+  const warmOnce = useRef(false);
+
+  const prefetchAndWarm = () => {
+    router.prefetch(href);
+    if (warmOnce.current) return;
+    warmOnce.current = true;
+    if (process.env.NODE_ENV === "development") {
+      console.info("[predicted][cache-warm] reconcile_intent", {
+        warmSource: "hover",
+        slug: market.id,
+        ts: Date.now(),
+      });
+    }
+    void fetch("/api/market/volume-reconcile", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slug: market.id, warmSource: "hover" }),
+    }).catch(() => {});
+  };
+
   return (
     <article className={cn("min-h-0", FEED_TILE_CLASS)}>
       <Link
-        href={`/markets/${encodeURIComponent(market.id)}`}
+        href={href}
+        onMouseEnter={prefetchAndWarm}
+        onFocus={prefetchAndWarm}
         className="flex h-full min-h-0 flex-col overflow-hidden rounded-2xl bg-[#111] ring-1 ring-white/[0.05] transition-colors duration-200 hover:bg-[#161616]"
       >
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">

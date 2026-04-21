@@ -1,14 +1,23 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { useMemo, useState } from "react";
-import { chartLinePathFromScreenPoints } from "@/lib/chart/monotone-cubic-path";
+import { useCallback, useMemo, useState, type MouseEvent } from "react";
+import { stepAfterLinePath } from "@/lib/chart/monotone-cubic-path";
+import {
+  evenTimeTicks,
+  stepPriceAfterAtT,
+  type ChartPathPoint,
+} from "@/lib/chart/time-series-path";
 import { cn } from "@/lib/utils/cn";
 
 type Point = { t: number; p: number };
 
-type ProbabilityChartProps = {
+export type ProbabilityChartProps = {
   series: Point[];
+  /** Visible time window — line and axis use this domain (rolling 24h for 1D, etc.). */
+  xDomain: { minT: number; maxT: number };
+  /** Number of x-axis labels (evenly spaced in time). */
+  xTickCount?: number;
   className?: string;
   /** When this changes, the line stroke re-draws (e.g. history load, range, live tick). */
   drawEpoch?: string;
@@ -22,76 +31,127 @@ const padR = 48;
 const padT = 8;
 const padB = 28;
 
+function formatTickLabel(t: number, spanMs: number, tickIndex: number, tickCount: number): string {
+  const isLast = tickIndex === tickCount - 1;
+  if (isLast && spanMs <= 35 * 24 * 60 * 60 * 1000) {
+    const skew = Math.abs(Date.now() - t);
+    if (skew < 120_000) return "Now";
+  }
+  if (spanMs <= 6 * 60 * 60 * 1000) {
+    return new Date(t).toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+  if (spanMs <= 72 * 60 * 60 * 1000) {
+    return new Date(t).toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+  return new Date(t).toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+  });
+}
+
 export function ProbabilityChart({
   series,
+  xDomain,
+  xTickCount = 5,
   className,
   drawEpoch = "default",
 }: ProbabilityChartProps) {
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [hover, setHover] = useState<{
+    svgX: number;
+    t: number;
+    p: number;
+    clientX: number;
+    clientY: number;
+  } | null>(null);
+
+  const pathSeries: ChartPathPoint[] = useMemo(() => {
+    return [...series].sort((a, b) => a.t - b.t);
+  }, [series]);
 
   const domain = useMemo(() => {
-    if (series.length < 2) return null;
-    return {
-      minT: series[0].t,
-      maxT: series[series.length - 1].t,
-    };
-  }, [series]);
+    const span = xDomain.maxT - xDomain.minT;
+    if (!Number.isFinite(span) || span <= 0) return null;
+    return { minT: xDomain.minT, maxT: xDomain.maxT, span };
+  }, [xDomain.minT, xDomain.maxT]);
 
   const xScale = useMemo(() => {
     if (!domain) return null;
-    const span = domain.maxT - domain.minT || 1;
-    return (t: number) =>
-      padL + ((t - domain.minT) / span) * (w - padL - padR);
+    const plotW = w - padL - padR;
+    return (t: number) => padL + ((t - domain.minT) / domain.span) * plotW;
   }, [domain]);
+
+  const invX = useCallback(
+    (svgX: number): number | null => {
+      if (!domain) return null;
+      const plotW = w - padL - padR;
+      const clamped = Math.max(padL, Math.min(w - padR, svgX));
+      return domain.minT + ((clamped - padL) / plotW) * domain.span;
+    },
+    [domain],
+  );
 
   const yScale = (p: number) => padT + (1 - p) * (h - padT - padB);
 
   const screenPts = useMemo(() => {
-    if (series.length === 1) {
-      const p = series[0]!;
-      const cx = (padL + w - padR) / 2;
-      return [{ x: cx, y: yScale(p.p) }];
-    }
     if (!xScale) return [];
-    return series.map((pt) => ({ x: xScale(pt.t), y: yScale(pt.p) }));
-  }, [series, xScale]);
+    return pathSeries.map((pt) => ({ x: xScale(pt.t), y: yScale(pt.p) }));
+  }, [pathSeries, xScale]);
 
   const linePath = useMemo(() => {
-    if (series.length < 2 || !domain || !xScale) return "";
-    return chartLinePathFromScreenPoints(screenPts);
-  }, [series.length, domain, xScale, screenPts]);
+    if (pathSeries.length < 2 || !xScale) return "";
+    return stepAfterLinePath(screenPts);
+  }, [pathSeries.length, screenPts, xScale]);
 
   const areaPath = useMemo(() => {
-    if (series.length < 2 || !linePath || !domain || !xScale) return "";
-    const xf = xScale;
-    const x0 = xf(domain.minT);
-    const x1 = xf(domain.maxT);
+    if (pathSeries.length < 2 || !linePath || !domain || !xScale) return "";
+    const x0 = xScale(domain.minT);
+    const x1 = xScale(domain.maxT);
     return `${linePath} L ${x1} ${h - padB} L ${x0} ${h - padB} Z`;
-  }, [linePath, domain, xScale, series.length]);
-
-  const single = series.length === 1 ? series[0] : null;
-  const singleX = (padL + w - padR) / 2;
-  const singleY = single ? yScale(single.p) : 0;
-
-  const hovered = hoverIdx != null ? series[hoverIdx] : null;
-
-  /** Nearest screen point on curve for hover dot (snap to real snapshots). */
-  const hoverScreen =
-    hoverIdx != null && screenPts[hoverIdx]
-      ? screenPts[hoverIdx]
-      : null;
+  }, [linePath, domain, xScale, pathSeries.length]);
 
   const yTicks = [0, 0.25, 0.5, 0.75, 1];
 
   const xTicks = useMemo(() => {
-    if (series.length < 2 || !domain || !xScale) return [];
-    return [0, 1 / 3, 2 / 3, 1].map((f) => {
-      const t = domain.minT + (domain.maxT - domain.minT) * f;
-      return { t, x: xScale(t) };
-    });
-  }, [series.length, domain, xScale]);
+    if (!domain || !xScale) return [];
+    const n = Math.max(2, Math.min(8, xTickCount));
+    const times = evenTimeTicks(domain.minT, domain.maxT, n);
+    return times.map((t) => ({ t, x: xScale(t) }));
+  }, [domain, xScale, xTickCount]);
 
-  if (!series.length) {
+  const onSvgMouseMove = useCallback(
+    (e: MouseEvent<SVGRectElement>) => {
+      const svg = e.currentTarget.ownerSVGElement;
+      if (!svg || !domain) return;
+      const pt = svg.createSVGPoint();
+      pt.x = e.clientX;
+      pt.y = e.clientY;
+      const ctm = svg.getScreenCTM();
+      if (!ctm) return;
+      const cursor = pt.matrixTransform(ctm.inverse());
+      const clampedX = Math.max(padL, Math.min(w - padR, cursor.x));
+      const tHover = invX(clampedX);
+      if (tHover == null) return;
+      const pHover = stepPriceAfterAtT(pathSeries, tHover);
+      setHover({
+        svgX: clampedX,
+        t: tHover,
+        p: pHover,
+        clientX: e.clientX,
+        clientY: e.clientY,
+      });
+    },
+    [domain, invX, pathSeries],
+  );
+
+  if (!series.length || !domain || !xScale) {
     return (
       <div
         className={cn(
@@ -103,6 +163,9 @@ export function ProbabilityChart({
       </div>
     );
   }
+
+  const spanMs = domain.span;
+  const tickCount = xTicks.length;
 
   return (
     <div className={cn("relative", className)}>
@@ -154,27 +217,17 @@ export function ProbabilityChart({
             fill="none"
             stroke="rgb(255 255 255)"
             strokeWidth="1.75"
-            strokeLinecap="round"
-            strokeLinejoin="round"
+            strokeLinecap="butt"
+            strokeLinejoin="miter"
             vectorEffect="non-scaling-stroke"
             initial={{ opacity: 0.35 }}
             animate={{ opacity: 1 }}
             transition={{ duration: 0.55, ease: [0.22, 1, 0.36, 1] }}
           />
         ) : null}
-        {single ? (
-          <circle
-            cx={singleX}
-            cy={singleY}
-            r="4"
-            fill="white"
-            stroke="rgba(0,0,0,0.25)"
-            strokeWidth="1"
-          />
-        ) : null}
         {xTicks.map((tick, idx) => (
           <text
-            key={idx}
+            key={`${tick.t}-${idx}`}
             x={tick.x}
             y={h - 8}
             textAnchor={
@@ -183,10 +236,7 @@ export function ProbabilityChart({
             fill="rgba(255,255,255,0.32)"
             fontSize="10"
           >
-            {new Date(tick.t).toLocaleTimeString([], {
-              hour: "numeric",
-              minute: "2-digit",
-            })}
+            {formatTickLabel(tick.t, spanMs, idx, tickCount)}
           </text>
         ))}
         <rect
@@ -195,55 +245,59 @@ export function ProbabilityChart({
           width={w - padL - padR}
           height={h - padT - padB}
           fill="transparent"
-          onMouseMove={(e) => {
-            const svg = e.currentTarget.ownerSVGElement;
-            if (!svg) return;
-            const pt = svg.createSVGPoint();
-            pt.x = e.clientX;
-            pt.y = e.clientY;
-            const cursor = pt.matrixTransform(svg.getScreenCTM()?.inverse());
-            const clampedX = Math.max(padL, Math.min(w - padR, cursor.x));
-            if (series.length === 1) {
-              setHoverIdx(0);
-              return;
-            }
-            const ratio = (clampedX - padL) / (w - padL - padR);
-            const idx = Math.round(ratio * (series.length - 1));
-            setHoverIdx(Math.max(0, Math.min(series.length - 1, idx)));
-          }}
-          onMouseLeave={() => setHoverIdx(null)}
+          onMouseMove={onSvgMouseMove}
+          onMouseLeave={() => setHover(null)}
         />
-        {hovered && hoverScreen ? (
+        {hover ? (
           <>
             <line
-              x1={hoverScreen.x}
+              x1={hover.svgX}
               y1={padT}
-              x2={hoverScreen.x}
+              x2={hover.svgX}
               y2={h - padB}
-              stroke="rgba(255,255,255,0.1)"
+              stroke="rgba(255,255,255,0.14)"
               strokeWidth="1"
             />
             <circle
-              cx={hoverScreen.x}
-              cy={hoverScreen.y}
+              cx={hover.svgX}
+              cy={yScale(hover.p)}
               r="3.5"
               fill="white"
             />
           </>
         ) : null}
       </svg>
-      {hovered ? (
-        <div className="pointer-events-none absolute left-2 top-2 rounded-md bg-zinc-950/90 px-2 py-1 text-[10px] text-zinc-200 shadow-sm ring-1 ring-white/[0.06]">
-          <div className="text-zinc-500">
-            {new Date(hovered.t).toLocaleString(undefined, {
+      {hover ? (
+        <div
+          className="pointer-events-none fixed z-20 max-w-[200px] rounded-md bg-zinc-950/95 px-2.5 py-1.5 text-[10px] text-zinc-200 shadow-lg ring-1 ring-white/[0.08]"
+          style={{
+            left: Math.max(
+              8,
+              Math.min(
+                hover.clientX + 14,
+                (typeof window !== "undefined" ? window.innerWidth : 9999) - 140,
+              ),
+            ),
+            top: Math.max(
+              8,
+              Math.min(
+                hover.clientY + 14,
+                (typeof window !== "undefined" ? window.innerHeight : 9999) - 56,
+              ),
+            ),
+          }}
+        >
+          <div className="tabular-nums text-zinc-500">
+            {new Date(hover.t).toLocaleString(undefined, {
               month: "short",
               day: "numeric",
               hour: "numeric",
               minute: "2-digit",
+              second: spanMs <= 6 * 60 * 60 * 1000 ? "2-digit" : undefined,
             })}
           </div>
-          <div className="font-semibold tabular-nums text-white">
-            {Math.round(hovered.p * 100)}%
+          <div className="mt-0.5 font-semibold tabular-nums text-white">
+            {Math.round(hover.p * 100)}%
           </div>
         </div>
       ) : null}

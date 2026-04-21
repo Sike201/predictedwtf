@@ -1,8 +1,31 @@
-import { enrichMarketsWithOnChainStats } from "@/lib/market/enrich-markets-chain";
 import { marketRecordToMarket } from "@/lib/market/market-record-adapter";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import type { MarketRecord } from "@/lib/types/market-record";
 import type { Market } from "@/lib/types/market";
+
+function logDbReadDetail(row: MarketRecord, slug: string) {
+  if (process.env.NODE_ENV !== "development") return;
+  console.info("[predicted][volume-trace] db_read_detail_row", {
+    slug,
+    id: row.id,
+    last_known_volume_usd: row.last_known_volume_usd,
+    vol_type: typeof row.last_known_volume_usd,
+    last_stats_updated_at: row.last_stats_updated_at ?? null,
+  });
+}
+
+/** Homepage cards read `last_known_volume_usd` only (see `marketRecordToMarket`). */
+function logHomepageVolumeFetch(rows: MarketRecord[], markets: Market[]) {
+  const marketsPayload = rows.map((r, i) => ({
+    slug: r.slug,
+    last_known_volume_usd: r.last_known_volume_usd,
+    renderedVolumeUsd: markets[i]?.snapshot.volumeUsd,
+  }));
+  console.info("[predicted][homepage-volume-fetch]", {
+    count: rows.length,
+    markets: marketsPayload,
+  });
+}
 
 const LP = "[predicted][markets-fetch]";
 
@@ -29,7 +52,17 @@ export async function fetchLiveMarketsForFeed(): Promise<Market[]> {
   console.info(`${LP} homepage fetched ${rows.length} live markets`);
 
   const markets = rows.map((row, i) => marketRecordToMarket(row, i));
-  return enrichMarketsWithOnChainStats(markets);
+  console.info("[predicted][cache-warm] homepage_volume_source", {
+    event: "ssr_feed_row",
+    phase: "initial_html_path",
+    source: "db_last_known_volume_usd_last_stats",
+    marketCount: markets.length,
+    ts: Date.now(),
+  });
+  if (process.env.NODE_ENV === "development") {
+    logHomepageVolumeFetch(rows, markets);
+  }
+  return markets;
 }
 
 /** Single market for `/markets/[slug]` — must be `live`. */
@@ -55,9 +88,9 @@ export async function fetchLiveMarketBySlug(
   }
 
   if (data) {
-    console.info(`${LP} detail page fetched market`, {
-      slug: (data as MarketRecord).slug,
-    });
+    const rec = data as MarketRecord;
+    console.info(`${LP} detail page fetched market`, { slug: rec.slug });
+    logDbReadDetail(rec, slug);
   }
 
   return data as MarketRecord | null;

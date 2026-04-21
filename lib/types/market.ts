@@ -73,6 +73,8 @@ export interface MarketSnapshot {
 
 export interface Market {
   id: string;
+  /** Supabase `markets.id` (UUID) when loaded from DB — for server-side cache updates. */
+  marketRowId?: string;
   question: string;
   description: string;
   imageUrl: string;
@@ -97,6 +99,8 @@ export interface Market {
   views?: string | number;
   /** Longer AI-style summary for the detail page. */
   aiOverview?: string;
+  /** ISO timestamp from `markets.last_stats_updated_at` (cached stats row). */
+  lastStatsUpdatedAt?: string | null;
 }
 
 export interface MarketDraft {

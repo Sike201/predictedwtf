@@ -1,13 +1,18 @@
 "use client";
 
-import { animate } from "framer-motion";
-import { useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils/cn";
 
-export function fmtUsdCompactVol(n: number) {
-  if (n >= 1_000_000) return `$${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `$${(n / 1_000).toFixed(1)}K`;
-  return n.toLocaleString("en-US", {
+export function fmtUsdCompactVol(n: unknown): string {
+  const x =
+    typeof n === "number" && Number.isFinite(n)
+      ? Math.max(0, n)
+      : typeof n === "string"
+        ? Math.max(0, Number.parseFloat(n) || 0)
+        : 0;
+  if (!Number.isFinite(x)) return "$0";
+  if (x >= 1_000_000) return `$${(x / 1_000_000).toFixed(1)}M`;
+  if (x >= 1_000) return `$${(x / 1_000).toFixed(1)}K`;
+  return x.toLocaleString("en-US", {
     style: "currency",
     currency: "USD",
     maximumFractionDigits: 0,
@@ -25,7 +30,7 @@ type Props = {
 };
 
 /**
- * Subtle count-up when aggregated volume updates (on-chain totals).
+ * Volume display (no animation — avoids stale/blank frames during prop updates).
  */
 export function AnimatedVolume({
   value,
@@ -33,23 +38,12 @@ export function AnimatedVolume({
   suffixMuted = true,
   className,
 }: Props) {
-  const [display, setDisplay] = useState(0);
-  const fromRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    const from = fromRef.current ?? 0;
-    fromRef.current = value;
-    const ctrl = animate(from, value, {
-      duration: 0.75,
-      ease: [0.16, 1, 0.3, 1],
-      onUpdate: (latest) => setDisplay(Math.max(0, latest)),
-    });
-    return () => ctrl.stop();
-  }, [value]);
+  const display = Number.isFinite(value) ? Math.max(0, value) : 0;
+  const label = fmtUsdCompactVol(display);
 
   return (
     <span className={cn("tabular-nums", className)}>
-      {fmtUsdCompactVol(display)}
+      {label}
       <span className={suffixMuted ? "text-zinc-600" : undefined}>{suffix}</span>
     </span>
   );

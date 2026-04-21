@@ -19,6 +19,24 @@ export function linearLinePath(pts: ScreenPt[]): string {
 }
 
 /**
+ * Step-after (post): hold prior y until the next x, then jump vertically.
+ * Horizontal segments between trades; vertical segments at price changes.
+ */
+export function stepAfterLinePath(pts: ScreenPt[]): string {
+  if (pts.length < 2) return "";
+  let d = `M ${pts[0].x} ${pts[0].y}`;
+  for (let i = 1; i < pts.length; i += 1) {
+    const prev = pts[i - 1]!;
+    const cur = pts[i]!;
+    if (cur.x !== prev.x) {
+      d += ` L ${cur.x} ${prev.y}`;
+    }
+    d += ` L ${cur.x} ${cur.y}`;
+  }
+  return d;
+}
+
+/**
  * Monotone piecewise cubic (Fritsch–Carlson tangents), converted to cubic Bézier
  * segments. x must be strictly increasing (time axis).
  */

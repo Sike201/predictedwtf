@@ -153,10 +153,13 @@ export async function buildCloseLeveragedYesPositionTransaction(params: {
   const collateralVaultYes = layout.collateralForMint(params.yesMint);
 
   const tx = new Transaction();
-  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+  /** Unique per build so retries / double-submits never reuse identical serialized bytes. */
+  const microLamports = Math.floor(Math.random() * 900_000) + 1;
+  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports }));
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_200_000 }));
 
   let hadPreSwap = false;
+  let preSwapInYes = 0n;
 
   if (debtNo > 0n && noBal < debtNo) {
     const shortfall = debtNo - noBal;
@@ -174,6 +177,7 @@ export async function buildCloseLeveragedYesPositionTransaction(params: {
       maxIn: yesBal,
       estimateOut: estOut,
     });
+    preSwapInYes = swapInYes;
     const est = estOut(swapInYes);
     const minOutSwap = applySlippageFloor(est, params.slippageBps);
     tx.add(
@@ -221,6 +225,25 @@ export async function buildCloseLeveragedYesPositionTransaction(params: {
         collateralMint: params.yesMint,
         user: params.user,
         amount: OMNIPAIR_U64_MAX,
+      }),
+    );
+  }
+
+  if (typeof process !== "undefined" && process.env.NODE_ENV === "development") {
+    console.info(
+      "[predicted][close-leverage-build]",
+      JSON.stringify({
+        direction: "yes",
+        user: params.user.toBase58(),
+        pair: params.pairAddress.toBase58(),
+        debtNoAtoms: debtNo.toString(),
+        collateralYesAtoms: collYes.toString(),
+        yesWalletAtoms: yesBal.toString(),
+        noWalletAtoms: noBal.toString(),
+        hadPreSwap,
+        preSwapInYesAtoms: preSwapInYes.toString(),
+        yesAta: yesAta.toBase58(),
+        noAta: noAta.toBase58(),
       }),
     );
   }
@@ -310,10 +333,12 @@ export async function buildCloseLeveragedNoPositionTransaction(params: {
   const collateralVaultNo = layout.collateralForMint(params.noMint);
 
   const tx = new Transaction();
-  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }));
+  const microLamports = Math.floor(Math.random() * 900_000) + 1;
+  tx.add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports }));
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: 1_200_000 }));
 
   let hadPreSwap = false;
+  let preSwapInNo = 0n;
 
   if (debtYes > 0n && yesBal < debtYes) {
     const shortfall = debtYes - yesBal;
@@ -331,6 +356,7 @@ export async function buildCloseLeveragedNoPositionTransaction(params: {
       maxIn: noBal,
       estimateOut: estOut,
     });
+    preSwapInNo = swapInNo;
     const est = estOut(swapInNo);
     const minOutSwap = applySlippageFloor(est, params.slippageBps);
     tx.add(
@@ -378,6 +404,25 @@ export async function buildCloseLeveragedNoPositionTransaction(params: {
         collateralMint: params.noMint,
         user: params.user,
         amount: OMNIPAIR_U64_MAX,
+      }),
+    );
+  }
+
+  if (typeof process !== "undefined" && process.env.NODE_ENV === "development") {
+    console.info(
+      "[predicted][close-leverage-build]",
+      JSON.stringify({
+        direction: "no",
+        user: params.user.toBase58(),
+        pair: params.pairAddress.toBase58(),
+        debtYesAtoms: debtYes.toString(),
+        collateralNoAtoms: collNo.toString(),
+        yesWalletAtoms: yesBal.toString(),
+        noWalletAtoms: noBal.toString(),
+        hadPreSwap,
+        preSwapInNoAtoms: preSwapInNo.toString(),
+        yesAta: yesAta.toBase58(),
+        noAta: noAta.toBase58(),
       }),
     );
   }

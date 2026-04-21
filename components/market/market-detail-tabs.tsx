@@ -7,7 +7,7 @@ import { marketDisplayMeta } from "@/lib/data/market-presentation";
 import {
   MARKET_COMMENTS_UPDATED_EVENT,
   addMarketComment,
-  readMarketComments,
+  readMarketCommentsForDisplay,
   type MarketComment,
 } from "@/lib/market/market-comments";
 import {
@@ -79,19 +79,28 @@ export function MarketDetailTabs({ market }: Props) {
   const [holdersError, setHoldersError] = useState<string | null>(null);
 
   useEffect(() => {
-    setComments(readMarketComments(market.id));
-  }, [market.id]);
+    const list = readMarketCommentsForDisplay(market.id, market.marketRowId);
+    if (process.env.NODE_ENV === "development") {
+      console.info("[predicted][market-comments]", {
+        marketSlug: market.id,
+        marketRowId: market.marketRowId ?? null,
+        count: list.length,
+        sample: list.slice(0, 3).map((c) => ({ id: c.id, at: c.at })),
+      });
+    }
+    setComments(list);
+  }, [market.id, market.marketRowId]);
 
   useEffect(() => {
     const handler = (ev: Event) => {
       const ce = ev as CustomEvent<{ slug?: string }>;
       if (ce.detail?.slug === market.id) {
-        setComments(readMarketComments(market.id));
+        setComments(readMarketCommentsForDisplay(market.id, market.marketRowId));
       }
     };
     window.addEventListener(MARKET_COMMENTS_UPDATED_EVENT, handler);
     return () => window.removeEventListener(MARKET_COMMENTS_UPDATED_EVENT, handler);
-  }, [market.id]);
+  }, [market.id, market.marketRowId]);
 
   useEffect(() => {
     const full = readRecentMarketTransactions(market.id, walletForActivity);

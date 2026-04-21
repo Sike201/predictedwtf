@@ -113,6 +113,11 @@ export function MarketSellOutcomeButton({
     }
 
     try {
+      console.info("[predicted][sell-volume-trace]", {
+        step: "sell_click",
+        marketSlug: market.id,
+        sellSide,
+      });
       console.info(
         "[predicted][sell-outcome-usdc] client: request start",
         JSON.stringify({
@@ -192,6 +197,12 @@ export function MarketSellOutcomeButton({
 
       const usdcOutAtoms = data.log?.usdcOutAtoms ?? "0";
 
+      console.info("[predicted][sell-volume-trace]", {
+        step: "tx_signature",
+        marketSlug: market.id,
+        txSignature: sig,
+      });
+
       onTradeSuccess?.({
         signature: sig,
         sellSide,
@@ -202,7 +213,6 @@ export function MarketSellOutcomeButton({
       if (onTradeSuccess) {
         setFeedback(null);
       }
-      router.refresh();
     } catch (e) {
       const friendly = formatSellError(e);
       setFeedback(friendly);

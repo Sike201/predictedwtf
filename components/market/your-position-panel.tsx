@@ -3,7 +3,7 @@
 import { useConnection } from "@solana/wallet-adapter-react";
 import { PublicKey } from "@solana/web3.js";
 import { ExternalLink } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TxExplorerLink } from "@/components/market/tx-explorer-link";
 import type { OmnipairUserPositionSnapshot } from "@/lib/hooks/use-omnipair-user-position";
@@ -21,6 +21,11 @@ import {
 } from "@/lib/market/omnipair-position-metrics";
 import type { Market } from "@/lib/types/market";
 import {
+  readWalletOutcomeSnapshot,
+  walletOutcomeReturnDelta,
+} from "@/lib/market/close-position-wallet-delta";
+import { isDuplicateSolanaSubmitError } from "@/lib/market/solana-submit-errors";
+import {
   buildCloseLeveragedNoPositionTransaction,
   buildCloseLeveragedYesPositionTransaction,
 } from "@/lib/solana/omnipair-close-leverage";
@@ -31,6 +36,7 @@ import { devnetAccountExplorerUrl } from "@/lib/utils/solana-explorer";
 import { cn } from "@/lib/utils/cn";
 
 const SLIPPAGE_BPS = 150;
+const CLOSE_LOG = "[predicted][your-position-close]";
 
 const actionBtnClass =
   "rounded-md border border-white/[0.12] px-2 py-1 text-[10px] font-medium text-zinc-200 transition hover:border-white/[0.2] hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-40";
@@ -40,7 +46,7 @@ type Props = {
   snapshot: OmnipairUserPositionSnapshot | null;
   loading: boolean;
   error: string | null;
-  onPositionTxSettled?: () => void;
+  onPositionTxSettled?: (detail?: { signature?: string }) => void;
 };
 
 function hasActiveLendingPosition(s: OmnipairUserPositionSnapshot | null): boolean {
@@ -66,7 +72,15 @@ export function YourPositionPanel({
 
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [lastSig, setLastSig] = useState<string | null>(null);
+  const [lastCloseDetail, setLastCloseDetail] = useState<{
+    closeSig: string;
+    returnedYesHuman: string;
+    returnedNoHuman: string;
+    walletYesAfterHuman: string;
+    walletNoAfterHuman: string;
+    walletUsdcAfterHuman: string;
+  } | null>(null);
+  const closeInFlightRef = useRef(false);
 
   const pool = market.pool;
   const pairAddress = useMemo(
@@ -153,14 +167,25 @@ export function YourPositionPanel({
 
   const runClose = useCallback(
     async (which: "yes" | "no") => {
+      if (closeInFlightRef.current) {
+        if (process.env.NODE_ENV === "development") {
+          console.info(CLOSE_LOG, "ignored_concurrent_close");
+        }
+        return;
+      }
+      closeInFlightRef.current = true;
       setActionError(null);
-      setLastSig(null);
+      setLastCloseDetail(null);
       if (!connected || !publicKey || !signTransaction || !pairAddress || !yesMint || !noMint) {
         setActionError("Connect a wallet.");
+        closeInFlightRef.current = false;
         return;
       }
       setBusy(true);
       try {
+        if (process.env.NODE_ENV === "development") {
+          console.info(CLOSE_LOG, "close_click", JSON.stringify({ which }));
+        }
         const built =
           which === "yes"
             ? await buildCloseLeveragedYesPositionTransaction({
@@ -180,28 +205,128 @@ export function YourPositionPanel({
                 slippageBps: SLIPPAGE_BPS,
               });
 
+        if (process.env.NODE_ENV === "development") {
+          console.info(
+            CLOSE_LOG,
+            "tx_built",
+            JSON.stringify({ which, buildLog: built.log }),
+          );
+        }
+
+        const walletBefore = await readWalletOutcomeSnapshot({
+          connection,
+          owner: publicKey,
+          yesMint,
+          noMint,
+        });
+
         const { blockhash, lastValidBlockHeight } =
           await connection.getLatestBlockhash("confirmed");
         built.transaction.feePayer = publicKey;
         built.transaction.recentBlockhash = blockhash;
+
+        if (process.env.NODE_ENV === "development") {
+          console.info(CLOSE_LOG, "wallet_sign_start");
+        }
         const signed = await signTransaction(built.transaction);
-        const sig = await connection.sendRawTransaction(signed.serialize(), {
+        if (process.env.NODE_ENV === "development") {
+          console.info(CLOSE_LOG, "tx_signed");
+        }
+
+        const raw = signed.serialize();
+        if (process.env.NODE_ENV === "development") {
+          console.info(CLOSE_LOG, "tx_send", JSON.stringify({ bytes: raw.length }));
+        }
+        const sig = await connection.sendRawTransaction(raw, {
           skipPreflight: false,
           maxRetries: 0,
         });
+        if (process.env.NODE_ENV === "development") {
+          console.info(CLOSE_LOG, "tx_sent", JSON.stringify({ signature: sig }));
+        }
         await connection.confirmTransaction(
           { signature: sig, blockhash, lastValidBlockHeight },
           "confirmed",
         );
-        setLastSig(sig);
-        onPositionTxSettled?.();
+        if (process.env.NODE_ENV === "development") {
+          console.info(CLOSE_LOG, "tx_confirmed", JSON.stringify({ signature: sig }));
+        }
+
+        await new Promise((r) => setTimeout(r, 400));
+        const walletAfter = await readWalletOutcomeSnapshot({
+          connection,
+          owner: publicKey,
+          yesMint,
+          noMint,
+        });
+        const { returnedYes, returnedNo } = walletOutcomeReturnDelta(
+          walletBefore,
+          walletAfter,
+        );
+        balances.refresh();
+        setLastCloseDetail({
+          closeSig: sig,
+          returnedYesHuman: formatBaseUnitsToDecimalString(
+            returnedYes,
+            walletAfter.yesDecimals,
+            6,
+          ),
+          returnedNoHuman: formatBaseUnitsToDecimalString(
+            returnedNo,
+            walletAfter.noDecimals,
+            6,
+          ),
+          walletYesAfterHuman: formatBaseUnitsToDecimalString(
+            walletAfter.yesRaw,
+            walletAfter.yesDecimals,
+            6,
+          ),
+          walletNoAfterHuman: formatBaseUnitsToDecimalString(
+            walletAfter.noRaw,
+            walletAfter.noDecimals,
+            6,
+          ),
+          walletUsdcAfterHuman: formatBaseUnitsToDecimalString(
+            walletAfter.usdcRaw,
+            walletAfter.usdcDecimals,
+            2,
+          ),
+        });
+        if (process.env.NODE_ENV === "development") {
+          console.info(
+            CLOSE_LOG,
+            "wallet_after_close",
+            JSON.stringify({
+              returnedYes: returnedYes.toString(),
+              returnedNo: returnedNo.toString(),
+              walletYesAfter: walletAfter.yesRaw.toString(),
+              walletNoAfter: walletAfter.noRaw.toString(),
+            }),
+          );
+        }
+
+        onPositionTxSettled?.({ signature: sig });
       } catch (e: unknown) {
-        setActionError(e instanceof Error ? e.message : "Close failed");
+        const raw = e instanceof Error ? e.message : "Close failed";
+        if (isDuplicateSolanaSubmitError(raw)) {
+          setActionError(
+            "This transaction may have already confirmed. Refreshing your balances and position…",
+          );
+          balances.refresh();
+          onPositionTxSettled?.();
+        } else {
+          setActionError(raw);
+        }
+        if (process.env.NODE_ENV === "development") {
+          console.warn(CLOSE_LOG, "error", JSON.stringify({ message: raw }));
+        }
       } finally {
+        closeInFlightRef.current = false;
         setBusy(false);
       }
     },
     [
+      balances.refresh,
       connection,
       onPositionTxSettled,
       pairAddress,
@@ -232,6 +357,7 @@ export function YourPositionPanel({
               type="button"
               disabled={busy || !connected}
               onClick={() => void runClose("yes")}
+              title="Repay debt and unlock YES-track collateral; outcome tokens return to your wallet."
               className={actionBtnClass}
             >
               {busy ? "…" : "Close YES"}
@@ -240,6 +366,7 @@ export function YourPositionPanel({
               type="button"
               disabled={busy || !connected}
               onClick={() => void runClose("no")}
+              title="Repay debt and unlock NO-track collateral; outcome tokens return to your wallet."
               className={actionBtnClass}
             >
               {busy ? "…" : "Close NO"}
@@ -250,6 +377,7 @@ export function YourPositionPanel({
             type="button"
             disabled={busy || !connected || (!hasYesTrack && !hasNoTrack)}
             onClick={() => void onClosePosition()}
+            title="Repay debt and unlock collateral; unwound YES/NO returns to your wallet — not USDC."
             className={actionBtnClass}
           >
             {busy ? "…" : "Close position"}
@@ -363,6 +491,15 @@ export function YourPositionPanel({
             </div>
           ) : null}
 
+          {hasActiveLendingPosition(snapshot) ? (
+            <p className="mt-2 text-[10px] leading-snug text-zinc-600">
+              <span className="text-zinc-500">Close position</span> repays debt and unlocks
+              collateral. Returned assets are sent to your wallet as{" "}
+              <span className="text-zinc-500">YES / NO</span> outcome tokens — not USDC. Use{" "}
+              <span className="text-zinc-500">Sell</span> if you want to convert to USDC.
+            </p>
+          ) : null}
+
           <details className="group mt-3 open:pb-0">
             <summary className="cursor-pointer list-none text-[10px] font-medium text-zinc-500 marker:content-none [&::-webkit-details-marker]:hidden">
               <span className="underline decoration-zinc-600 underline-offset-2 group-open:text-zinc-400">
@@ -416,12 +553,44 @@ export function YourPositionPanel({
           {actionError ? (
             <p className="mt-2 text-[10px] text-amber-200/90">{actionError}</p>
           ) : null}
-          {lastSig ? (
-            <div className="mt-2 text-[10px]">
-              <TxExplorerLink
-                signature={lastSig}
-                linkClassName="!text-white decoration-white/25 hover:!text-zinc-200 hover:decoration-white/40"
-              />
+          {lastCloseDetail ? (
+            <div className="mt-2 space-y-1.5 rounded-md border border-white/[0.06] bg-white/[0.02] p-2 text-[10px] text-zinc-400">
+              <p className="text-[9px] font-medium text-zinc-500">Position closed</p>
+              <p className="text-zinc-300">
+                <span className="text-zinc-500">Returned YES</span>{" "}
+                <span className="font-semibold tabular-nums text-zinc-100">
+                  {lastCloseDetail.returnedYesHuman}
+                </span>
+              </p>
+              <p className="text-zinc-300">
+                <span className="text-zinc-500">Returned NO</span>{" "}
+                <span className="font-semibold tabular-nums text-zinc-100">
+                  {lastCloseDetail.returnedNoHuman}
+                </span>
+              </p>
+              <p className="text-zinc-600">
+                Wallet now — YES:{" "}
+                <span className="tabular-nums text-zinc-400">
+                  {lastCloseDetail.walletYesAfterHuman}
+                </span>
+                {" · "}
+                NO:{" "}
+                <span className="tabular-nums text-zinc-400">
+                  {lastCloseDetail.walletNoAfterHuman}
+                </span>
+                {" · "}
+                USDC:{" "}
+                <span className="tabular-nums text-zinc-400">
+                  {lastCloseDetail.walletUsdcAfterHuman}
+                </span>
+              </p>
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 pt-0.5">
+                <span className="text-zinc-500">Transaction</span>
+                <TxExplorerLink
+                  signature={lastCloseDetail.closeSig}
+                  linkClassName="!text-white decoration-white/25 hover:!text-zinc-200 hover:decoration-white/40"
+                />
+              </div>
             </div>
           ) : null}
         </>

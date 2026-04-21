@@ -1,6 +1,10 @@
 import { PublicKey } from "@solana/web3.js";
 import { NextResponse } from "next/server";
 
+import {
+  compareVolumePipelineToOrderbookEntry,
+  logVolumeVsOrderbookDev,
+} from "@/lib/market/volume-orderbook-compare";
 import { fetchPoolOnchainActivity } from "@/lib/solana/fetch-pool-onchain-activity";
 import { getConnection } from "@/lib/solana/connection";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
@@ -34,7 +38,7 @@ export async function GET(req: Request) {
 
     const { data, error } = await sb
       .from("markets")
-      .select("slug,status,pool_address,yes_mint,no_mint")
+      .select("id,slug,status,pool_address,yes_mint,no_mint")
       .eq("slug", slug)
       .maybeSingle();
 
@@ -43,6 +47,7 @@ export async function GET(req: Request) {
     }
 
     const row = data as {
+      id: string;
       status: string;
       pool_address: string | null;
       yes_mint: string | null;
@@ -62,12 +67,35 @@ export async function GET(req: Request) {
     }
 
     const connection = getConnection();
+    const yesPk = new PublicKey(row.yes_mint);
+    const noPk = new PublicKey(row.no_mint);
+
     const entries = await fetchPoolOnchainActivity(connection, {
       pairAddress: new PublicKey(row.pool_address),
-      yesMint: new PublicKey(row.yes_mint),
-      noMint: new PublicKey(row.no_mint),
+      yesMint: yesPk,
+      noMint: noPk,
       limit,
     });
+
+    if (process.env.NODE_ENV === "development" && entries.length > 0) {
+      const swapLike =
+        entries.find((e) => /^(BUY|SELL) (YES|NO)$/.test(e.label)) ??
+        entries[0]!;
+      try {
+        const cmp = await compareVolumePipelineToOrderbookEntry({
+          connection,
+          marketId: row.id,
+          yesMint: yesPk,
+          noMint: noPk,
+          sample: swapLike,
+        });
+        logVolumeVsOrderbookDev(cmp);
+      } catch (e) {
+        console.warn("[predicted][volume-vs-orderbook] compare_failed", {
+          message: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
 
     return NextResponse.json({
       pairAddress: row.pool_address,

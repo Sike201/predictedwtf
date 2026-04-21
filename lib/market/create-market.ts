@@ -14,6 +14,7 @@ import {
   mintOutcomeToken,
 } from "@/lib/solana/create-outcome-mints";
 import { recordMarketPriceSnapshotFromChain } from "@/lib/market/market-price-history";
+import { seedMarketPriceHistoryIfEmpty } from "@/lib/market/seed-market-price-history";
 import { DEMO_LIQUIDITY_ATOMICS } from "@/lib/solana/seed-market-liquidity";
 import { getConnection } from "@/lib/solana/connection";
 import {
@@ -382,6 +383,10 @@ export async function createMarketPipeline(
           mint_no_tx: mintNoTx,
           pool_init_tx: poolInitTx,
           seed_liquidity_tx: seedTx,
+          last_known_yes_price: 0.5,
+          last_known_no_price: 0.5,
+          last_known_volume_usd: 0,
+          last_stats_updated_at: new Date().toISOString(),
         })
         .eq("id", marketId)
         .select()
@@ -409,12 +414,47 @@ export async function createMarketPipeline(
             });
             if (!snap.ok) {
               console.warn(`${LP} initial market_price_history failed`, snap.error);
+              const repair = await seedMarketPriceHistoryIfEmpty(
+                (live as MarketRecord).slug,
+              );
+              if (repair.ok && repair.seeded) {
+                console.info(
+                  `${LP} chart history repaired via seed after failed snapshot`,
+                );
+              } else if (!repair.ok) {
+                console.warn(`${LP} chart seed failed`, repair.error);
+              }
             }
           } catch (e) {
             console.warn(
               `${LP} initial market_price_history exception`,
               formatUnknownError(e),
             );
+            try {
+              const repair = await seedMarketPriceHistoryIfEmpty(
+                (live as MarketRecord).slug,
+              );
+              if (repair.ok && repair.seeded) {
+                console.info(
+                  `${LP} chart history repaired via seed after exception`,
+                );
+              } else if (!repair.ok) {
+                console.warn(`${LP} chart seed failed`, repair.error);
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+        } else {
+          const repair = await seedMarketPriceHistoryIfEmpty(
+            (live as MarketRecord).slug,
+          );
+          if (repair.ok && repair.seeded) {
+            console.info(
+              `${LP} chart history seeded (no bootstrap tx sig on record)`,
+            );
+          } else if (!repair.ok) {
+            console.warn(`${LP} chart seed failed`, repair.error);
           }
         }
       }

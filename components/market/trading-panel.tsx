@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWallet } from "@/lib/hooks/use-wallet";
@@ -17,7 +18,6 @@ import {
 import type {
   SellOutcomeForUsdcBuildLog,
   SellOutcomePlan,
-  SellRouteKind,
 } from "@/lib/solana/sell-outcome-for-usdc";
 import {
   formatProbabilityAsWholeCents,
@@ -38,19 +38,6 @@ function formatUsdcAtomsHuman(atoms: string): string {
   }
 }
 
-function sellRouteHeadline(kind: SellRouteKind): string {
-  switch (kind) {
-    case "full_usdc_exit":
-      return "Full USDC exit (est.)";
-    case "partial_usdc_exit":
-      return "Partial USDC exit (est.)";
-    case "fallback_pool_swap":
-      return "Pool swap to opposite side (est.)";
-    default:
-      return "Exit route";
-  }
-}
-
 export type TradePanelMode = "buy_yes" | "buy_no" | "sell_yes" | "sell_no";
 
 type TradingPanelProps = {
@@ -66,11 +53,13 @@ type TradingPanelProps = {
   /** Refetch lending position after a spot trade (shared with Your position). */
   onOmnipairRefresh?: () => void;
   /** Persist pool snapshot to `market_price_history` and refresh the probability chart. */
-  onTradePriceSnapshot?: (txSignature: string) => void | Promise<void>;
+  onTradePriceSnapshot?: (txSignature: string) => void | Promise<unknown>;
   /** Omnipair snapshot for the **Leverage** tab (binary + pool). */
   omnipairSnapshot?: OmnipairUserPositionSnapshot | null;
-  /** After leverage tx — refetch position and pool (same as `onOmnipairRefresh` + pool). */
-  onLeverageAfterTx?: () => void | Promise<void>;
+  /** After leverage tx — refetch position and pool; `signature` when known for snapshot/volume. */
+  onLeverageAfterTx?: (
+    detail?: { signature?: string },
+  ) => void | Promise<void>;
 };
 
 type Tab = "buy" | "sell" | "leverage";
@@ -436,10 +425,39 @@ export function TradingPanel({
         amountLabel,
       });
       balances.refresh();
-      router.refresh();
       refreshOmnipairPosition();
       onPoolTxSettled?.();
-      void onTradePriceSnapshot?.(signature);
+      if (process.env.NODE_ENV === "development") {
+        console.info("[predicted][volume-verify] recordAfterTrade_path", {
+          path: "buy",
+          slug: market.id,
+          signature,
+        });
+      }
+      console.info("[predicted][buy-volume-trace] client_success", {
+        txSignature: signature,
+        marketSlug: market.id,
+        marketRowId: market.marketRowId ?? null,
+        willCallRecordAfterTrade: typeof onTradePriceSnapshot === "function",
+      });
+      void (async () => {
+        console.info("[predicted][buy-volume-trace] client_success", {
+          step: "recordAfterTrade_await_start",
+          txSignature: signature,
+          marketSlug: market.id,
+        });
+        try {
+          await onTradePriceSnapshot?.(signature);
+        } catch (e) {
+          console.warn("[predicted][buy-volume-trace] client_success", {
+            step: "recordAfterTrade_threw",
+            txSignature: signature,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        } finally {
+          router.refresh();
+        }
+      })();
     },
     [
       balances,
@@ -498,10 +516,29 @@ export function TradingPanel({
         receiveNote,
       });
       balances.refresh();
-      router.refresh();
       refreshOmnipairPosition();
       onPoolTxSettled?.();
-      void onTradePriceSnapshot?.(signature);
+      if (process.env.NODE_ENV === "development") {
+        console.info("[predicted][volume-verify] recordAfterTrade_path", {
+          path: "sell",
+          slug: market.id,
+          signature,
+        });
+      }
+      void (async () => {
+        console.info("[predicted][sell-volume-trace]", {
+          step: "recordAfterTrade_called",
+          marketSlug: market.id,
+          txSignature: signature,
+        });
+        try {
+          await onTradePriceSnapshot?.(signature);
+        } catch {
+          /* record may fail; still refresh for other UI */
+        } finally {
+          router.refresh();
+        }
+      })();
     },
     [
       balances,
@@ -757,31 +794,33 @@ export function TradingPanel({
             ))}
           </div>
           {tab === "sell" && connected && publicKey && parsedOutcome > 0 ? (
-            <div className="mt-3 space-y-1 border-t border-white/[0.06] pt-3 text-[10px] leading-relaxed text-zinc-500">
+            <div className="mt-3 border-t border-white/[0.06] pt-3">
               {sellPlanLoading ? (
-                <p className="text-zinc-600">Estimating exit route…</p>
+                <p className="text-[11px] text-zinc-600">Estimating exit route…</p>
               ) : sellPlanError ? (
-                <p className="text-amber-200/90">{sellPlanError}</p>
+                <p className="text-[12px] text-amber-200/90">{sellPlanError}</p>
               ) : sellPlan ? (
-                <>
-                  <p className="font-medium text-zinc-400">
-                    {sellRouteHeadline(sellPlan.routeKind)}
-                  </p>
-                  <p>{sellPlan.uiSummary}</p>
-                  <p className="tabular-nums text-zinc-500">
-                    Est. USDC:{" "}
-                    <span className="text-zinc-300">
-                      {sellPlan.routeKind === "fallback_pool_swap"
-                        ? "—"
-                        : formatUsdcAtomsHuman(sellPlan.usdcOutAtoms)}
-                    </span>
-                    {" · "}
-                    Pool reserves YES / NO:{" "}
-                    <span className="text-zinc-400">
-                      {sellPlan.reserveYes} / {sellPlan.reserveNo}
-                    </span>
-                  </p>
-                </>
+                <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
+                  <span className="text-[11px] font-medium tracking-wide text-zinc-500">
+                    Est.
+                  </span>
+                  {sellPlan.routeKind === "fallback_pool_swap" ? (
+                    <span className="text-[15px] font-medium text-zinc-400">—</span>
+                  ) : (
+                    <>
+                      <span className="text-[1.125rem] font-semibold tabular-nums tracking-tight text-zinc-50">
+                        {formatUsdcAtomsHuman(sellPlan.usdcOutAtoms)}
+                      </span>
+                      <Image
+                        src="/Circle_USDC_Logo.png"
+                        alt=""
+                        width={22}
+                        height={22}
+                        className="h-[22px] w-[22px] shrink-0 rounded-full"
+                      />
+                    </>
+                  )}
+                </div>
               ) : null}
             </div>
           ) : null}

@@ -11,7 +11,7 @@ import type { Market } from "@/lib/types/market";
 type Props = {
   market: Market;
   snapshot: OmnipairUserPositionSnapshot | null;
-  onAfterTx: () => void | Promise<void>;
+  onAfterTx: (detail?: { signature?: string }) => void | Promise<void>;
 };
 
 /**
@@ -70,11 +70,13 @@ export function MarketOutcomeLeveragePanel({
   const onSettled = useCallback(
     async (detail?: { signature: string }) => {
       balances.refresh();
-      await Promise.resolve(onAfterTx());
+      await Promise.resolve(
+        onAfterTx(detail ? { signature: detail.signature } : undefined),
+      );
       const sig = detail?.signature;
       if (sig) await verifyPositionAfterTx(sig);
     },
-    [balances, onAfterTx, verifyPositionAfterTx],
+    [balances.refresh, onAfterTx, verifyPositionAfterTx],
   );
 
   if (!pool?.poolId) return null;

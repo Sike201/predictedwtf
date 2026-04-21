@@ -35,6 +35,11 @@ export type LiveOmnipairPoolState = {
 
 export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
   const { connection } = useConnection();
+  const poolId = market.pool?.poolId ?? null;
+  const yesMintId = market.pool?.yesMint ?? null;
+  const noMintId = market.pool?.noMint ?? null;
+  const marketId = market.id;
+
   const [yesProbability, setYes] = useState<number | null>(null);
   const [noProbability, setNo] = useState<number | null>(null);
   const [unavailable, setUnavailable] = useState(true);
@@ -57,8 +62,13 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
 
   const refresh = useCallback(
     async (reason = "refresh") => {
-      const pool = market.pool;
-      if (!pool?.poolId || !pool.yesMint || !pool.noMint) {
+      if (!poolId || !yesMintId || !noMintId) {
+        if (process.env.NODE_ENV === "development") {
+          console.info(
+            "[predicted][pool-live][skip_no_pool]",
+            JSON.stringify({ reason, marketId, poolId, yesMintId, noMintId }),
+          );
+        }
         if (mounted.current) {
           setUnavailable(true);
           setOneSidedLiquidity(false);
@@ -73,9 +83,9 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
       setLoading(true);
       try {
         const state = await readOmnipairPoolState(connection, {
-          pairAddress: new PublicKey(pool.poolId),
-          yesMint: new PublicKey(pool.yesMint),
-          noMint: new PublicKey(pool.noMint),
+          pairAddress: new PublicKey(poolId),
+          yesMint: new PublicKey(yesMintId),
+          noMint: new PublicKey(noMintId),
         });
         const oneSide = isOneSidedLiquidity(state);
         const derived = deriveMarketProbabilityFromPoolState(state);
@@ -158,6 +168,17 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
         setRefreshEpoch((n) => n + 1);
       } catch (e) {
         console.warn(`[predicted][pool-live] ${reason} failed`, e);
+        if (process.env.NODE_ENV === "development") {
+          console.info(
+            "[predicted][pool-live][error_fallback]",
+            JSON.stringify({
+              reason,
+              marketId,
+              poolId,
+              message: e instanceof Error ? e.message : String(e),
+            }),
+          );
+        }
         if (mounted.current) {
           setUnavailable(true);
           setOneSidedLiquidity(false);
@@ -170,7 +191,7 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
         if (mounted.current) setLoading(false);
       }
     },
-    [connection, market.pool],
+    [connection, marketId, poolId, yesMintId, noMintId],
   );
 
   useEffect(() => {

@@ -26,6 +26,11 @@ export interface MarketRecord {
   pool_init_tx?: string | null;
   seed_liquidity_tx?: string | null;
   created_at: string;
+  /** Denormalized from last successful snapshot / trade (instant feed). */
+  last_known_yes_price?: number | null;
+  last_known_no_price?: number | null;
+  last_known_volume_usd?: number | null;
+  last_stats_updated_at?: string | null;
 }
 
 export interface CreateMarketPayload {

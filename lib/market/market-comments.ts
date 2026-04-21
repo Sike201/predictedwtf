@@ -30,6 +30,28 @@ export function readMarketComments(slug: string): MarketComment[] {
   }
 }
 
+/**
+ * Merge comments stored under any legacy key (slug casing, or row id) so threads stay visible.
+ */
+export function readMarketCommentsForDisplay(
+  slug: string,
+  marketRowId?: string | null,
+): MarketComment[] {
+  if (typeof window === "undefined") return [];
+  const keys = new Set<string>();
+  keys.add(slug);
+  if (slug !== slug.toLowerCase()) keys.add(slug.toLowerCase());
+  if (marketRowId && marketRowId !== slug) keys.add(marketRowId);
+
+  const merged = new Map<string, MarketComment>();
+  for (const k of keys) {
+    for (const c of readMarketComments(k)) {
+      merged.set(c.id, c);
+    }
+  }
+  return Array.from(merged.values()).sort((a, b) => b.at - a.at);
+}
+
 export function addMarketComment(
   slug: string,
   bodyRaw: string,

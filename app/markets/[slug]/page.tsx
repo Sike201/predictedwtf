@@ -1,7 +1,7 @@
 import { notFound } from "next/navigation";
 import { MarketDetailView } from "@/components/market/market-detail-view";
-import { enrichMarketWithOnChainStats } from "@/lib/market/enrich-markets-chain";
 import { fetchLiveMarketBySlug } from "@/lib/market/fetch-markets";
+import { fetchMarketPriceHistoryPoints } from "@/lib/market/market-price-history";
 import { marketRecordToMarket } from "@/lib/market/market-record-adapter";
 
 export const dynamic = "force-dynamic";
@@ -10,11 +10,31 @@ export const revalidate = 0;
 type PageProps = { params: Promise<{ slug: string }> };
 
 export default async function MarketBySlugPage({ params }: PageProps) {
+  const t0 = Date.now();
   const { slug } = await params;
   const record = await fetchLiveMarketBySlug(decodeURIComponent(slug));
   if (!record) notFound();
 
   const base = marketRecordToMarket(record, 0);
-  const market = await enrichMarketWithOnChainStats(base);
-  return <MarketDetailView market={market} />;
+  const chartFetchedAt = Date.now();
+  const chartPoints = await fetchMarketPriceHistoryPoints(decodeURIComponent(slug));
+  const initialChartHistory = chartPoints.map(({ t, p }) => ({ t, p }));
+
+  if (process.env.NODE_ENV === "development") {
+    console.info("[predicted][market-page-server]", {
+      slug: decodeURIComponent(slug),
+      ms: Date.now() - t0,
+      rscSnapshotVolumeUsd: base.snapshot.volumeUsd,
+      lastStatsUpdatedAt: base.lastStatsUpdatedAt ?? null,
+      rowLastKnownVol: record.last_known_volume_usd,
+      chartHistoryPoints: initialChartHistory.length,
+    });
+  }
+  return (
+    <MarketDetailView
+      market={base}
+      initialChartHistory={initialChartHistory}
+      chartHistoryServerFetchedAtMs={chartFetchedAt}
+    />
+  );
 }

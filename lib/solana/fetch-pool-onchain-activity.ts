@@ -5,6 +5,7 @@ import bs58 from "bs58";
 import { Connection, PublicKey } from "@solana/web3.js";
 import type { ParsedTransactionWithMeta } from "@solana/web3.js";
 
+import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
 import { anchorDiscriminator } from "@/lib/solana/anchor-util";
 import { getOmnipairProgramId } from "@/lib/solana/omnipair-program";
 import { outcomeBaseUnitsToUsdcBaseUnits } from "@/lib/solana/mint-market-positions";
@@ -123,6 +124,204 @@ function swapLabelAndUsd(
 }
 
 const DUST_ATOMS = 10n;
+
+function firstSignerPubkey(tx: ParsedTransactionWithMeta): PublicKey | null {
+  try {
+    const msg = tx.transaction.message as unknown as {
+      getAccountKeys?: () => { staticAccountKeys: PublicKey[] };
+      staticAccountKeys?: PublicKey[];
+      accountKeys?: PublicKey[];
+    };
+    if (typeof msg.getAccountKeys === "function") {
+      const keys = msg.getAccountKeys().staticAccountKeys;
+      const k = keys[0];
+      if (k) return k instanceof PublicKey ? k : new PublicKey(k);
+    }
+    const raw = msg.staticAccountKeys?.[0] ?? msg.accountKeys?.[0];
+    if (!raw) return null;
+    return raw instanceof PublicKey ? raw : new PublicKey(raw as string);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Devnet USDC leg: net USDC received by the fee payer (custody → user on sell redeem).
+ */
+function inferUsdcNetToFeePayerMicros(
+  tx: ParsedTransactionWithMeta,
+): bigint {
+  const payer = firstSignerPubkey(tx);
+  if (!payer) return 0n;
+  const payerStr = payer.toBase58();
+  const usdc = DEVNET_USDC_MINT.toBase58();
+  const pre = tx.meta?.preTokenBalances ?? [];
+  const post = tx.meta?.postTokenBalances ?? [];
+  const indices = new Set<number>();
+  for (const t of [...pre, ...post]) {
+    if (t.mint === usdc && t.owner === payerStr) indices.add(t.accountIndex);
+  }
+  let maxNet = 0n;
+  for (const idx of indices) {
+    const p0 = tokenBalanceAtoms(
+      pre.find((x) => x.accountIndex === idx && x.mint === usdc),
+    );
+    const p1 = tokenBalanceAtoms(
+      post.find((x) => x.accountIndex === idx && x.mint === usdc),
+    );
+    const d = p1 - p0;
+    if (d > maxNet) maxNet = d;
+  }
+  return maxNet > 0n ? maxNet : 0n;
+}
+
+/**
+ * USDC sent **from** the fee payer (user → custody on buy-with-USDC).
+ * Pairs with `inferUsdcNetToFeePayerMicros`; swap-ix parse can miss CPI layouts — custody notional still counts as volume.
+ */
+function inferUsdcSentByFeePayerMicros(
+  tx: ParsedTransactionWithMeta,
+): bigint {
+  const payer = firstSignerPubkey(tx);
+  if (!payer) return 0n;
+  const payerStr = payer.toBase58();
+  const usdc = DEVNET_USDC_MINT.toBase58();
+  const pre = tx.meta?.preTokenBalances ?? [];
+  const post = tx.meta?.postTokenBalances ?? [];
+  const indices = new Set<number>();
+  for (const t of [...pre, ...post]) {
+    if (t.mint === usdc && t.owner === payerStr) indices.add(t.accountIndex);
+  }
+  let maxOut = 0n;
+  for (const idx of indices) {
+    const p0 = tokenBalanceAtoms(
+      pre.find((x) => x.accountIndex === idx && x.mint === usdc),
+    );
+    const p1 = tokenBalanceAtoms(
+      post.find((x) => x.accountIndex === idx && x.mint === usdc),
+    );
+    const d = p0 - p1;
+    if (d > maxOut) maxOut = d;
+  }
+  return maxOut > 0n ? maxOut : 0n;
+}
+
+/**
+ * Paired YES+NO burn to exit into USDC (sell flow without a countable swap ix decode).
+ * Uses fee-payer-owned outcome ATAs only (avoids vault noise).
+ */
+function inferPairedOutcomeBurnUsdMicrosForFeePayer(
+  tx: ParsedTransactionWithMeta,
+  yesMint: PublicKey,
+  noMint: PublicKey,
+): bigint {
+  const payer = firstSignerPubkey(tx);
+  if (!payer) return 0n;
+  const payerStr = payer.toBase58();
+  const ys = yesMint.toBase58();
+  const ns = noMint.toBase58();
+
+  const pre = tx.meta?.preTokenBalances ?? [];
+  const post = tx.meta?.postTokenBalances ?? [];
+  const indices = new Set<number>();
+  for (const t of [...pre, ...post]) {
+    if (t.owner !== payerStr) continue;
+    if (t.mint === ys || t.mint === ns) indices.add(t.accountIndex);
+  }
+
+  let burnYes = 0n;
+  let burnNo = 0n;
+  for (const idx of indices) {
+    const pY = pre.find((x) => x.accountIndex === idx && x.mint === ys);
+    const oY = post.find((x) => x.accountIndex === idx && x.mint === ys);
+    const pN = pre.find((x) => x.accountIndex === idx && x.mint === ns);
+    const oN = post.find((x) => x.accountIndex === idx && x.mint === ns);
+    const y0 = tokenBalanceAtoms(pY);
+    const y1 = tokenBalanceAtoms(oY);
+    const n0 = tokenBalanceAtoms(pN);
+    const n1 = tokenBalanceAtoms(oN);
+    if (y0 > y1) {
+      const b = y0 - y1;
+      if (b > burnYes) burnYes = b;
+    }
+    if (n0 > n1) {
+      const b = n0 - n1;
+      if (b > burnNo) burnNo = b;
+    }
+  }
+
+  let atoms = 0n;
+  if (burnYes > DUST_ATOMS && burnNo > DUST_ATOMS) {
+    atoms = burnYes < burnNo ? burnYes : burnNo;
+  } else {
+    atoms = burnYes >= burnNo ? burnYes : burnNo;
+  }
+  if (atoms <= DUST_ATOMS) return 0n;
+  return outcomeBaseUnitsToUsdcBaseUnits(atoms);
+}
+
+export type ParsedTradeVolumeUsd = {
+  /** USDC micro-units (6 dp) */
+  micros: bigint;
+  /** Which heuristic produced `micros` */
+  source: string;
+};
+
+/**
+ * Full trade volume for a tx: Omnipair swap ix, then USDCNative sell redeem legs, then balance fallback.
+ * Sell-to-USDC often pairs burn + custody transfer **without** a standalone YES↔NO swap amount
+ * matching `parseSwapUsdMicrosFromSwapIx` — custody USDC to user / paired burns must count.
+ */
+export function parseTradeVolumeUsdMicrosFromTx(
+  tx: ParsedTransactionWithMeta,
+  omnipairId: PublicKey,
+  yesMint: PublicKey,
+  noMint: PublicKey,
+): ParsedTradeVolumeUsd {
+  const swapMicros = parseSwapUsdMicrosFromSwapIx(
+    tx,
+    omnipairId,
+    yesMint,
+    noMint,
+  );
+  const primary = classifyTxFromInstructionsOnly(tx, omnipairId, yesMint, noMint);
+  if (primary.label === "Bootstrap") {
+    return { micros: 0n, source: "bootstrap" };
+  }
+
+  const usdcMicros = inferUsdcNetToFeePayerMicros(tx);
+  const usdcSentMicros = inferUsdcSentByFeePayerMicros(tx);
+  const pairedMicros = inferPairedOutcomeBurnUsdMicrosForFeePayer(
+    tx,
+    yesMint,
+    noMint,
+  );
+
+  /** Prefer largest explicit leg (buy USDC→custody vs sell redeem vs swap ix). */
+  let best: ParsedTradeVolumeUsd = { micros: 0n, source: "none" };
+  if (swapMicros > best.micros) {
+    best = { micros: swapMicros, source: "omnipair_swap_ix" };
+  }
+  if (usdcMicros > best.micros) {
+    best = { micros: usdcMicros, source: "usdc_to_fee_payer" };
+  }
+  if (usdcSentMicros > best.micros) {
+    best = { micros: usdcSentMicros, source: "usdc_from_fee_payer" };
+  }
+  if (pairedMicros > best.micros) {
+    best = { micros: pairedMicros, source: "paired_outcome_burn" };
+  }
+  if (best.micros > 0n) {
+    return best;
+  }
+
+  const leg = inferSwapLegFromTokenBalances(tx, yesMint, noMint);
+  if (!leg) {
+    return { micros: 0n, source: "none" };
+  }
+  const m = outcomeBaseUnitsToUsdcBaseUnits(leg.atoms);
+  return { micros: m, source: `token_balance_${leg.label}` };
+}
 
 /** Instruction / raw-data classification only (no token-balance fallback). */
 function classifyTxFromInstructionsOnly(
@@ -308,20 +507,24 @@ export function parseSwapUsdMicrosFromTx(
   yesMint: PublicKey,
   noMint: PublicKey,
 ): bigint {
-  const fromIx = parseSwapUsdMicrosFromSwapIx(tx, omnipairId, yesMint, noMint);
-  if (fromIx > 0n) return fromIx;
-  const leg = inferSwapLegFromTokenBalances(tx, yesMint, noMint);
-  if (!leg) return 0n;
-  return outcomeBaseUnitsToUsdcBaseUnits(leg.atoms);
+  return parseTradeVolumeUsdMicrosFromTx(tx, omnipairId, yesMint, noMint).micros;
 }
 
 const DEFAULT_VOLUME_SIG_CAP = 5000;
+
+export type PoolTotalSwapVolumeStats = {
+  volumeUsd: number;
+  /** Rows returned from `getSignaturesForAddress` (paginated, capped). */
+  signaturesScanned: number;
+  /** Parsed txs where YES↔NO swap notional > 0 (same loop as volume sum). */
+  swapsParsed: number;
+};
 
 /**
  * Sums swap notionals (instruction decode + balance fallback) across paginated pair history.
  * Capped for RPC cost — increase `maxSignatures` for fuller totals.
  */
-export async function fetchPoolTotalSwapVolumeUsd(
+export async function fetchPoolTotalSwapVolumeUsdWithStats(
   connection: Connection,
   params: {
     pairAddress: PublicKey;
@@ -329,11 +532,12 @@ export async function fetchPoolTotalSwapVolumeUsd(
     noMint: PublicKey;
     maxSignatures?: number;
   },
-): Promise<number> {
+): Promise<PoolTotalSwapVolumeStats> {
   const omnipairId = getOmnipairProgramId();
   const cap = Math.min(params.maxSignatures ?? DEFAULT_VOLUME_SIG_CAP, 50_000);
   const pageSize = 1000;
   let totalMicros = 0n;
+  let swapsParsed = 0;
   let before: string | undefined;
   let fetched = 0;
 
@@ -352,12 +556,14 @@ export async function fetchPoolTotalSwapVolumeUsd(
     for (let i = 0; i < txs.length; i++) {
       const tx = txs[i];
       if (!tx) continue;
-      totalMicros += parseSwapUsdMicrosFromTx(
+      const micros = parseSwapUsdMicrosFromTx(
         tx,
         omnipairId,
         params.yesMint,
         params.noMint,
       );
+      if (micros > 0n) swapsParsed += 1;
+      totalMicros += micros;
     }
 
     fetched += sigInfos.length;
@@ -366,7 +572,115 @@ export async function fetchPoolTotalSwapVolumeUsd(
     before = lastSig;
   }
 
-  return Number(totalMicros) / 1_000_000;
+  const volumeUsd = Number(totalMicros) / 1_000_000;
+  return {
+    volumeUsd: Number.isFinite(volumeUsd) ? volumeUsd : 0,
+    signaturesScanned: fetched,
+    swapsParsed,
+  };
+}
+
+/**
+ * @see fetchPoolTotalSwapVolumeUsdWithStats — same aggregation, number only.
+ */
+export async function fetchPoolTotalSwapVolumeUsd(
+  connection: Connection,
+  params: {
+    pairAddress: PublicKey;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+    maxSignatures?: number;
+  },
+): Promise<number> {
+  const s = await fetchPoolTotalSwapVolumeUsdWithStats(connection, params);
+  return s.volumeUsd;
+}
+
+export type SingleTxTradeVolumeResult = {
+  volumeUsd: number;
+  /** Parser winning leg (see `parseTradeVolumeUsdMicrosFromTx`). */
+  source: string;
+  txMissing: boolean;
+  metaErr: boolean;
+};
+
+/**
+ * Single confirmed tx → USD notional (swap ix, custody USDC flows, paired burn, or balance fallback).
+ */
+export async function fetchSingleTxTradeVolumeUsd(
+  connection: Connection,
+  params: {
+    signature: string;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+  },
+): Promise<SingleTxTradeVolumeResult> {
+  const omnipairId = getOmnipairProgramId();
+  let tx = await connection.getParsedTransaction(params.signature, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  });
+  if (!tx) {
+    tx = await connection.getParsedTransaction(params.signature, {
+      commitment: "confirmed",
+    });
+  }
+
+  if (!tx) {
+    return {
+      volumeUsd: 0,
+      source: "no_parsed_tx",
+      txMissing: true,
+      metaErr: false,
+    };
+  }
+  if (tx.meta?.err) {
+    return {
+      volumeUsd: 0,
+      source: "tx_meta_err",
+      txMissing: false,
+      metaErr: true,
+    };
+  }
+
+  const parsed = parseTradeVolumeUsdMicrosFromTx(
+    tx,
+    omnipairId,
+    params.yesMint,
+    params.noMint,
+  );
+  const volumeUsd = Number(parsed.micros) / 1_000_000;
+  const v = Number.isFinite(volumeUsd) ? volumeUsd : 0;
+
+  console.info("[predicted][sell-volume-trace]", {
+    step: "single_tx_volume_parsed",
+    txSignature: params.signature,
+    source: parsed.source,
+    volumeUsd: v,
+  });
+
+  return {
+    volumeUsd: v,
+    source: parsed.source,
+    txMissing: false,
+    metaErr: false,
+  };
+}
+
+/**
+ * Swap notional in USD for one confirmed tx (0 when not a countable YES↔NO swap).
+ * Fast: single `getParsedTransaction` — use after trades instead of full history scans.
+ */
+export async function fetchSwapVolumeUsdFromSingleTx(
+  connection: Connection,
+  params: {
+    signature: string;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+  },
+): Promise<number> {
+  const r = await fetchSingleTxTradeVolumeUsd(connection, params);
+  return r.volumeUsd;
 }
 
 function classifyTx(
@@ -434,7 +748,7 @@ export async function fetchPoolOnchainActivity(
 ): Promise<OnchainPoolActivityEntry[]> {
   /** Must match deployed program for ix decode; falls back without env. */
   const omnipairId = getOmnipairProgramId();
-  const cap = Math.min(Math.max(1, params.limit ?? 24), 40);
+  const cap = Math.min(Math.max(1, params.limit ?? 24), 100);
 
   const sigInfos = await connection.getSignaturesForAddress(
     params.pairAddress,
