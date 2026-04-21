@@ -7,6 +7,8 @@ import { marketDisplayMeta } from "@/lib/data/market-presentation";
 import {
   MARKET_COMMENTS_UPDATED_EVENT,
   addMarketComment,
+  logCommentsRepairDev,
+  migrateMarketCommentsToCanonical,
   readMarketCommentsForDisplay,
   type MarketComment,
 } from "@/lib/market/market-comments";
@@ -79,6 +81,8 @@ export function MarketDetailTabs({ market }: Props) {
   const [holdersError, setHoldersError] = useState<string | null>(null);
 
   useEffect(() => {
+    const repair = migrateMarketCommentsToCanonical(market.id, market.marketRowId);
+    logCommentsRepairDev(repair);
     const list = readMarketCommentsForDisplay(market.id, market.marketRowId);
     if (process.env.NODE_ENV === "development") {
       console.info("[predicted][market-comments]", {

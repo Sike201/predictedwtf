@@ -60,6 +60,32 @@ async function fetchHistoryFull(slug: string): Promise<Point[]> {
   return normalizePoints(raw);
 }
 
+async function postChartGapRepair(slug: string): Promise<{
+  ok: boolean;
+  appendMissingPointsCount?: number;
+  missingPointsDetected?: boolean;
+}> {
+  try {
+    const res = await fetch("/api/market/chart-gap-repair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slug }),
+    });
+    const j = (await res.json()) as {
+      ok?: boolean;
+      appendMissingPointsCount?: number;
+      missingPointsDetected?: boolean;
+    };
+    return {
+      ok: res.ok && j.ok === true,
+      appendMissingPointsCount: j.appendMissingPointsCount,
+      missingPointsDetected: j.missingPointsDetected,
+    };
+  } catch {
+    return { ok: false };
+  }
+}
+
 async function fetchHistoryIncremental(
   slug: string,
   sinceMsExclusive: number,
@@ -281,15 +307,65 @@ export function useMarketPriceHistory(params: {
               ),
             });
           }
-        } else if (process.env.NODE_ENV === "development") {
-          console.info(CHART_HYDRATE, {
-            event: "background_refresh_done",
-            slug,
-            strategy: "noop",
-            appendedPointsCount: 0,
-            fullReplaceVsIncrementalPatch: "incremental_patch",
-            note: "no new rows after latest cached ts",
-          });
+        } else {
+          const gap = await postChartGapRepair(slug);
+          if (cancelled) return;
+
+          let mergedAfterGap = false;
+          if (gap.ok) {
+            const inc2 = await fetchHistoryIncremental(slug, lastT);
+            if (!cancelled && inc2.length > 0) {
+              setSeries((prev) => mergeByT(prev, inc2));
+              mergedAfterGap = true;
+              if (process.env.NODE_ENV === "development") {
+                console.info(CHART_HYDRATE, {
+                  event: "background_refresh_done",
+                  slug,
+                  strategy: "incremental_after_gap_repair",
+                  gapRepairedPoints: gap.appendMissingPointsCount ?? 0,
+                  appendedPointsCount: inc2.length,
+                  missingPointsDetected: gap.missingPointsDetected,
+                  fullReplaceVsIncrementalPatch: "incremental_patch",
+                  timeToRefreshMs: Math.round(
+                    (typeof performance !== "undefined"
+                      ? performance.now()
+                      : 0) - bgStartedAt,
+                  ),
+                });
+              }
+            } else if (
+              gap.missingPointsDetected &&
+              (gap.appendMissingPointsCount ?? 0) === 0
+            ) {
+              const full = await fetchHistoryFull(slug);
+              if (!cancelled) {
+                setSeries(full);
+                mergedAfterGap = true;
+                if (process.env.NODE_ENV === "development") {
+                  console.info(CHART_HYDRATE, {
+                    event: "background_refresh_done",
+                    slug,
+                    strategy: "full_replace_after_gap_repair_no_incremental",
+                    pointCount: full.length,
+                    note: "chain ahead of DB but tx-meta repair failed — full fetch",
+                  });
+                }
+              }
+            }
+          }
+
+          if (!mergedAfterGap && process.env.NODE_ENV === "development") {
+            console.info(CHART_HYDRATE, {
+              event: "background_refresh_done",
+              slug,
+              strategy: "noop",
+              appendedPointsCount: 0,
+              gapRepairOk: gap.ok,
+              gapAppendCount: gap.appendMissingPointsCount ?? 0,
+              missingPointsDetected: gap.missingPointsDetected,
+              fullReplaceVsIncrementalPatch: "incremental_patch",
+            });
+          }
         }
       } catch (e) {
         if (process.env.NODE_ENV === "development") {
