@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useWallet } from "@/lib/hooks/use-wallet";
 import { useMarketTradingBalances } from "@/lib/hooks/use-market-trading-balances";
+import { addPendingDelta } from "@/lib/hooks/use-pending-volume-delta";
+import { runPostTradeRefreshSequence } from "@/lib/market/post-trade-router-refresh";
 import type { Market } from "@/lib/types/market";
 import { MarketOutcomeLeveragePanel } from "@/components/market/market-outcome-leverage-panel";
 import { MarketSellOutcomeButton } from "@/components/market/market-sell-outcome-button";
@@ -25,6 +27,32 @@ import {
 } from "@/lib/format/price-cents";
 import type { OmnipairUserPositionSnapshot } from "@/lib/hooks/use-omnipair-user-position";
 import { cn } from "@/lib/utils/cn";
+import {
+  computeResolvedRedeemFlags,
+  logResolvedRedeemUi,
+  resolvedRedeemRenderedState,
+  winningSideOrNull,
+} from "@/lib/market/resolved-redeem-ui";
+
+function baselineVolumeUsdForPending(m: Market): number {
+  const v = m.snapshot?.volumeUsd;
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, v) : 0;
+}
+
+function parseTradeUsdcFromBuyHuman(s: string): number {
+  const n = Number.parseFloat(s.trim().replace(/[^0-9.]/g, "")) || 0;
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function parseTradeUsdFromSellUsdcAtoms(atoms: string): number {
+  try {
+    const a = BigInt(atoms || "0");
+    const usd = Number(a) / 1_000_000;
+    return Number.isFinite(usd) && usd > 0 ? usd : 0;
+  } catch {
+    return 0;
+  }
+}
 
 function formatUsdcAtomsHuman(atoms: string): string {
   try {
@@ -117,17 +145,156 @@ export function TradingPanel({
 
   const refreshOmnipairPosition = onOmnipairRefresh ?? (() => {});
 
+  const isResolved = market.resolution.status === "resolved";
+  const isResolving = market.resolution.status === "resolving";
+  const winningSide = winningSideOrNull(
+    market.resolution.status,
+    market.resolution.resolvedOutcome,
+  );
+  const redeemFlags = useMemo(
+    () =>
+      computeResolvedRedeemFlags(winningSide, {
+        yesRaw: balances.yesRaw,
+        noRaw: balances.noRaw,
+        loading: balances.loading,
+      }),
+    [winningSide, balances.yesRaw, balances.noRaw, balances.loading],
+  );
+  /** For sell/redeem + pool preview: only ever the winning leg when resolved (ignore stale tab YES/NO). */
+  const sideForSell: "yes" | "no" = isResolved && winningSide
+    ? winningSide
+    : outcome;
+  const isBinary = market.kind === "binary";
+  const useDedicatedResolvedLayout = isResolved && isBinary;
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    console.info(
+      "[predicted][ui-state-trace]",
+      JSON.stringify({
+        component: "TradingPanel",
+        slug: market.id,
+        propName: "market",
+        displayedPhase: market.phase,
+        displayedResolutionStatus: market.resolution.status,
+        /** Resolving copy + badge use `isResolving` from status above */
+        tradingOpen_binaryUi: market.kind === "binary" && !isResolved && !isResolving,
+        isResolving,
+      }),
+    );
+  }, [
+    isResolving,
+    isResolved,
+    market.id,
+    market.kind,
+    market.phase,
+    market.resolution.status,
+  ]);
+
   const showLeverageTab =
+    !isResolved &&
+    !isResolving &&
     market.kind === "binary" &&
     !!market.pool?.poolId &&
     typeof onLeverageAfterTx === "function";
+
+  useEffect(() => {
+    if (isResolved) setTab("sell");
+  }, [isResolved, market.id]);
+
+  useEffect(() => {
+    if (!useDedicatedResolvedLayout || process.env.NODE_ENV !== "development") return;
+    if (!winningSide) {
+      logResolvedRedeemUi({
+        slug: market.id,
+        resolvedOutcome: null,
+        selectedUiSide: outcome,
+        winningSide: null,
+        userYesBalance: balances.yesRaw.toString(),
+        userNoBalance: balances.noRaw.toString(),
+        redeemableYes: false,
+        redeemableNo: false,
+        renderedPrimaryAction: "unknown_winner",
+        renderedState: "unknown_winner",
+      });
+      return;
+    }
+    const rs = resolvedRedeemRenderedState(connected, winningSide, {
+      yesRaw: balances.yesRaw,
+      noRaw: balances.noRaw,
+      loading: balances.loading,
+    }, redeemFlags);
+    const primary =
+      !connected
+        ? "connect_wallet"
+        : rs === "winning_redeem"
+          ? "redeem_winning"
+          : rs === "losing"
+            ? "losing_no_redeem"
+            : rs === "neutral"
+              ? "no_tokens"
+              : "—";
+    logResolvedRedeemUi({
+      slug: market.id,
+      resolvedOutcome: winningSide,
+      selectedUiSide: outcome,
+      winningSide,
+      userYesBalance: balances.yesRaw.toString(),
+      userNoBalance: balances.noRaw.toString(),
+      redeemableYes: redeemFlags.redeemableYes,
+      redeemableNo: redeemFlags.redeemableNo,
+      renderedPrimaryAction: primary,
+      renderedState: rs,
+    });
+  }, [
+    balances.loading,
+    balances.noRaw,
+    balances.yesRaw,
+    connected,
+    market.id,
+    outcome,
+    redeemFlags,
+    useDedicatedResolvedLayout,
+    winningSide,
+  ]);
+
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    if (!useDedicatedResolvedLayout || !winningSide) return;
+    console.info(
+      "[predicted][resolved-exit-model]",
+      JSON.stringify({
+        slug: market.id,
+        winningOutcome: winningSide,
+        userYesBalance: balances.yesRaw.toString(),
+        userNoBalance: balances.noRaw.toString(),
+        pairedBurnOutcomeAtoms: sellPlan?.pairedBurnOutcomeAtoms ?? null,
+        usdcOutAtoms: sellPlan?.usdcOutAtoms ?? null,
+        routeKind: sellPlan?.routeKind ?? null,
+        custodyUsdcAtoms: sellPlan?.custodyUsdcAtoms ?? null,
+      }),
+    );
+  }, [
+    balances.noRaw,
+    balances.yesRaw,
+    market.id,
+    sellPlan,
+    useDedicatedResolvedLayout,
+    winningSide,
+  ]);
 
   useEffect(() => {
     setTradeSuccess(null);
   }, [usdcAmount, outcomeAmount, tab, outcome]);
 
   useEffect(() => {
-    if (tab !== "sell" || market.kind !== "binary") {
+    const wantPlan =
+      market.kind === "binary" &&
+      !isResolving &&
+      ((isResolved && winningSide && redeemFlags.hasWinningBalance) ||
+        (!isResolved && tab === "sell"));
+
+    if (!wantPlan) {
       setSellPlan(null);
       setSellPlanError(null);
       setSellPlanLoading(false);
@@ -149,7 +316,7 @@ export function TradingPanel({
       setSellPlanError(null);
       const qs = new URLSearchParams({
         slug: market.id,
-        side: outcome === "yes" ? "yes" : "no",
+        side: sideForSell === "yes" ? "yes" : "no",
         outcomeAmountHuman: trimmed,
         userWallet: publicKey.toBase58(),
       });
@@ -163,7 +330,7 @@ export function TradingPanel({
             plan?: SellOutcomePlan;
           };
           if (!res.ok || data.error) {
-            throw new Error(data.error ?? "Could not estimate exit");
+            throw new Error(data.error ?? "Could not load sell preview");
           }
           setSellPlan(data.plan ?? null);
         })
@@ -171,7 +338,7 @@ export function TradingPanel({
           if ((e as Error).name === "AbortError") return;
           setSellPlan(null);
           setSellPlanError(
-            e instanceof Error ? e.message : "Could not estimate exit",
+            e instanceof Error ? e.message : "Could not load sell preview",
           );
         })
         .finally(() => {
@@ -183,7 +350,19 @@ export function TradingPanel({
       ac.abort();
       window.clearTimeout(t);
     };
-  }, [tab, market.id, market.kind, outcomeAmount, outcome, connected, publicKey]);
+  }, [
+    tab,
+    market.id,
+    market.kind,
+    outcomeAmount,
+    sideForSell,
+    connected,
+    publicKey,
+    isResolved,
+    isResolving,
+    winningSide,
+    redeemFlags.hasWinningBalance,
+  ]);
 
   useEffect(() => {
     if (tab === "buy") setOutcomeAmount("");
@@ -198,9 +377,9 @@ export function TradingPanel({
     if (tab === "sell") setOutcomeAmount("");
   }, [outcome, tab]);
 
-  const isBuy = tab === "buy";
-  const isSell = tab === "sell";
-  const isLeverage = tab === "leverage";
+  const isBuy = !isResolved && tab === "buy";
+  const isSell = !isResolved && tab === "sell";
+  const isLeverage = !isResolved && tab === "leverage";
   const buySide = outcome === "yes" ? "yes" : "no";
 
   const staticYes = market.pool?.yesPrice ?? market.yesProbability;
@@ -360,9 +539,9 @@ export function TradingPanel({
     setUsdcAmount(String(n));
   };
 
-  const sellBalanceRaw = outcome === "yes" ? balances.yesRaw : balances.noRaw;
+  const sellBalanceRaw = sideForSell === "yes" ? balances.yesRaw : balances.noRaw;
   const sellDecimals =
-    outcome === "yes" ? balances.yesDecimals : balances.noDecimals;
+    sideForSell === "yes" ? balances.yesDecimals : balances.noDecimals;
 
   const setSellPercent = useCallback(
     (pct: number) => {
@@ -382,9 +561,9 @@ export function TradingPanel({
 
   const balanceLineSell = useMemo(() => {
     if (!connected || !publicKey) return null;
-    const raw = outcome === "yes" ? balances.yesRaw : balances.noRaw;
-    const dec = outcome === "yes" ? balances.yesDecimals : balances.noDecimals;
-    const label = outcome === "yes" ? "YES" : "NO";
+    const raw = sideForSell === "yes" ? balances.yesRaw : balances.noRaw;
+    const dec = sideForSell === "yes" ? balances.yesDecimals : balances.noDecimals;
+    const label = sideForSell === "yes" ? "YES" : "NO";
     if (balances.loading) {
       return `Balance (${label}): …`;
     }
@@ -392,7 +571,7 @@ export function TradingPanel({
   }, [
     connected,
     publicKey,
-    outcome,
+    sideForSell,
     balances.yesRaw,
     balances.noRaw,
     balances.yesDecimals,
@@ -408,6 +587,14 @@ export function TradingPanel({
     }) => {
       const { signature, side: s, usdcAmountHuman: amt } = args;
       const trimmed = amt.trim() || "0";
+      const buyVolDelta = parseTradeUsdcFromBuyHuman(trimmed);
+      if (buyVolDelta > 0) {
+        addPendingDelta(
+          market.id,
+          buyVolDelta,
+          baselineVolumeUsdForPending(market),
+        );
+      }
       const amountLabel =
         trimmed === "0" || trimmed === "" ? "USDC" : `${trimmed} USDC`;
       pushRecentMarketTransaction(
@@ -440,28 +627,32 @@ export function TradingPanel({
         marketRowId: market.marketRowId ?? null,
         willCallRecordAfterTrade: typeof onTradePriceSnapshot === "function",
       });
-      void (async () => {
-        console.info("[predicted][buy-volume-trace] client_success", {
-          step: "recordAfterTrade_await_start",
-          txSignature: signature,
-          marketSlug: market.id,
-        });
-        try {
-          await onTradePriceSnapshot?.(signature);
-        } catch (e) {
-          console.warn("[predicted][buy-volume-trace] client_success", {
-            step: "recordAfterTrade_threw",
+      void runPostTradeRefreshSequence(router, {
+        slug: market.id,
+        txSignature: signature,
+        runVolumeUpdate: async () => {
+          console.info("[predicted][buy-volume-trace] client_success", {
+            step: "recordAfterTrade_await_start",
             txSignature: signature,
-            error: e instanceof Error ? e.message : String(e),
+            marketSlug: market.id,
           });
-        } finally {
-          router.refresh();
-        }
-      })();
+          try {
+            await onTradePriceSnapshot?.(signature);
+          } catch (e) {
+            console.warn("[predicted][buy-volume-trace] client_success", {
+              step: "recordAfterTrade_threw",
+              txSignature: signature,
+              error: e instanceof Error ? e.message : String(e),
+            });
+            throw e;
+          }
+        },
+      });
     },
     [
       balances,
       market.id,
+      market.snapshot.volumeUsd,
       onPoolTxSettled,
       onTradePriceSnapshot,
       publicKey,
@@ -491,6 +682,14 @@ export function TradingPanel({
           ? "shares"
           : `${trimmed} ${ss.toUpperCase()}`;
       const usdcHuman = formatUsdcAtomsHuman(usdcOutAtoms);
+      const sellVolDelta = parseTradeUsdFromSellUsdcAtoms(usdcOutAtoms);
+      if (sellVolDelta > 0) {
+        addPendingDelta(
+          market.id,
+          sellVolDelta,
+          baselineVolumeUsdForPending(market),
+        );
+      }
       const receiveNote =
         buildLog?.uiSummary ??
         (BigInt(usdcOutAtoms || "0") > 0n
@@ -499,7 +698,9 @@ export function TradingPanel({
       const amountSummary =
         buildLog?.routeKind === "fallback_pool_swap"
           ? `${amountLabel} · pool swap`
-          : `${amountLabel} → ~${usdcHuman} USDC`;
+          : buildLog?.routeKind === "resolved_winner_redeem"
+            ? `${amountLabel} → ${usdcHuman} USDC (settlement)`
+            : `${amountLabel} → ~${usdcHuman} USDC`;
       pushRecentMarketTransaction(
         market.id,
         {
@@ -515,6 +716,12 @@ export function TradingPanel({
         amountLabel,
         receiveNote,
       });
+      if (market.resolution.status === "resolved") {
+        console.info("[predicted][resolve]", "redeem_success", {
+          marketSlug: market.id,
+          sellSide: ss,
+        });
+      }
       balances.refresh();
       refreshOmnipairPosition();
       onPoolTxSettled?.();
@@ -525,50 +732,179 @@ export function TradingPanel({
           signature,
         });
       }
-      void (async () => {
-        console.info("[predicted][sell-volume-trace]", {
-          step: "recordAfterTrade_called",
-          marketSlug: market.id,
-          txSignature: signature,
-        });
-        try {
+      void runPostTradeRefreshSequence(router, {
+        slug: market.id,
+        txSignature: signature,
+        runVolumeUpdate: async () => {
+          console.info("[predicted][sell-volume-trace]", {
+            step: "recordAfterTrade_called",
+            marketSlug: market.id,
+            txSignature: signature,
+          });
           await onTradePriceSnapshot?.(signature);
-        } catch {
-          /* record may fail; still refresh for other UI */
-        } finally {
-          router.refresh();
-        }
-      })();
+        },
+      });
     },
     [
       balances,
       market.id,
+      market.snapshot.volumeUsd,
       onPoolTxSettled,
       onTradePriceSnapshot,
       publicKey,
       refreshOmnipairPosition,
       router,
+      market.resolution.status,
     ],
   );
+
+  const showResolvedRedeemForm =
+    useDedicatedResolvedLayout && winningSide && redeemFlags.hasWinningBalance;
+  const showAnySellForm = isSell || showResolvedRedeemForm;
 
   return (
     <>
     <div className="rounded-xl bg-[#111] p-4 ring-1 ring-white/[0.06]">
       {/* Buy / Sell + order type */}
+      {!isResolving ? (
+      <>
+      {useDedicatedResolvedLayout ? (
+        <div className="space-y-3">
+          {!winningSide ? (
+            <p className="rounded-lg border border-amber-500/20 bg-amber-950/25 px-3 py-2 text-[11px] text-amber-100/90">
+              Outcome not recorded yet. Redeem may be unavailable.
+            </p>
+          ) : null}
+          {showResolvedRedeemForm && connected && publicKey ? (
+            <div>
+              <p className="mb-2 text-[11px] font-medium text-zinc-400">
+                Redeem
+              </p>
+              <div className="mt-1 flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium text-zinc-500">
+                  Shares
+                </span>
+                {balanceLineSell ? (
+                  <span className="max-w-[60%] text-right text-[10px] text-zinc-600">
+                    {balanceLineSell}
+                  </span>
+                ) : null}
+              </div>
+              <div className="trade-field mt-2 flex items-baseline justify-end px-4 py-3">
+                <input
+                  value={outcomeAmount}
+                  onChange={(e) => setOutcomeAmount(e.target.value)}
+                  inputMode="decimal"
+                  placeholder="0"
+                  className="min-w-0 flex-1 border-0 bg-transparent text-right text-2xl font-semibold tabular-nums tracking-tight text-white outline-none placeholder:text-zinc-600 sm:text-[1.6rem]"
+                />
+              </div>
+              <div className="mt-3 flex flex-wrap justify-end gap-2">
+                {(
+                  [
+                    { label: "25%", pct: 25 },
+                    { label: "50%", pct: 50 },
+                    { label: "Max", pct: 100 },
+                  ] as const
+                ).map(({ label, pct }) => (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => setSellPercent(pct)}
+                    disabled={!connected || sellBalanceRaw <= 0n}
+                    className="rounded-lg border border-white/[0.08] bg-white/[0.04] px-3 py-1.5 text-[11px] font-medium text-zinc-400 transition hover:border-white/[0.14] hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              {parsedOutcome > 0 ? (
+                <div className="mt-3">
+                  {sellPlanLoading ? (
+                    <p className="text-[11px] text-zinc-600">
+                      Computing payout…
+                    </p>
+                  ) : sellPlanError ? (
+                    <p className="text-[12px] text-amber-200/90">{sellPlanError}</p>
+                  ) : sellPlan ? (
+                    <div className="space-y-1.5 text-right">
+                      {sellPlan.routeKind === "resolved_winner_redeem" ? (
+                        <p className="text-[10px] text-zinc-500">
+                          1 USDC per share, custody redemption
+                        </p>
+                      ) : (
+                        <p className="text-[10px] text-zinc-500">
+                          Route:{" "}
+                          <span className="font-mono text-zinc-400">
+                            {sellPlan.routeKind}
+                          </span>
+                        </p>
+                      )}
+                      <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
+                        <span className="text-[11px] font-medium tracking-wide text-zinc-500">
+                          {sellPlan.routeKind === "resolved_winner_redeem"
+                            ? "Payout (USDC)"
+                            : "Est. USDC (exit route)"}
+                        </span>
+                        {sellPlan.routeKind === "fallback_pool_swap" ? (
+                          <div className="text-right text-[10px] text-amber-200/80">
+                            No USDC on this path — {sellPlan.uiSummary}
+                          </div>
+                        ) : (
+                          <>
+                            <span className="text-[1.125rem] font-semibold tabular-nums tracking-tight text-zinc-50">
+                              {formatUsdcAtomsHuman(sellPlan.usdcOutAtoms)}
+                            </span>
+                            <Image
+                              src="/Circle_USDC_Logo.png"
+                              alt=""
+                              width={22}
+                              height={22}
+                              className="h-[22px] w-[22px] shrink-0 rounded-full"
+                            />
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+              <div className="mt-4">
+                <MarketSellOutcomeButton
+                  market={market}
+                  sellSide={sideForSell}
+                  outcomeAmountHuman={outcomeAmount}
+                  sellLabel={
+                    sideForSell === "yes" ? "Redeem YES" : "Redeem NO"
+                  }
+                  forResolutionRedeem
+                  onTradeSuccess={onSellSuccess}
+                  className={tradeButtonClass}
+                />
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {!useDedicatedResolvedLayout ? (
+      <>
       <div className="flex items-end justify-between gap-3 border-b border-white/[0.08] pb-2">
         <div className="flex min-w-0 flex-1 flex-wrap gap-x-6 gap-y-1">
-          <button
-            type="button"
-            onClick={() => setTab("buy")}
-            className={cn(
-              "relative pb-2 text-[14px] font-medium transition",
-              tab === "buy"
-                ? "text-white after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:rounded-full after:bg-white"
-                : "text-zinc-500 hover:text-zinc-300",
-            )}
-          >
-            Buy
-          </button>
+          {!isResolved ? (
+            <button
+              type="button"
+              onClick={() => setTab("buy")}
+              className={cn(
+                "relative pb-2 text-[14px] font-medium transition",
+                tab === "buy"
+                  ? "text-white after:absolute after:bottom-0 after:left-0 after:right-0 after:h-0.5 after:rounded-full after:bg-white"
+                  : "text-zinc-500 hover:text-zinc-300",
+              )}
+            >
+              Buy
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={() => setTab("sell")}
@@ -579,7 +915,7 @@ export function TradingPanel({
                 : "text-zinc-500 hover:text-zinc-300",
             )}
           >
-            Sell
+            {isResolved ? "Redeem" : "Sell"}
           </button>
           {showLeverageTab ? (
             <button
@@ -660,6 +996,8 @@ export function TradingPanel({
       </div>
       ) : null}
       </div>
+      </>
+      ) : null}
 
       {isBuy ? (
         <>
@@ -753,7 +1091,7 @@ export function TradingPanel({
         </>
       ) : null}
 
-      {isSell ? (
+      {showAnySellForm && !useDedicatedResolvedLayout ? (
         <div className="mt-5">
           <div className="flex items-center justify-between gap-2">
             <span className="text-[11px] font-medium text-zinc-500">
@@ -793,33 +1131,43 @@ export function TradingPanel({
               </button>
             ))}
           </div>
-          {tab === "sell" && connected && publicKey && parsedOutcome > 0 ? (
+          {connected && publicKey && parsedOutcome > 0 ? (
             <div className="mt-3 border-t border-white/[0.06] pt-3">
               {sellPlanLoading ? (
                 <p className="text-[11px] text-zinc-600">Estimating exit route…</p>
               ) : sellPlanError ? (
                 <p className="text-[12px] text-amber-200/90">{sellPlanError}</p>
               ) : sellPlan ? (
-                <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
-                  <span className="text-[11px] font-medium tracking-wide text-zinc-500">
-                    Est.
-                  </span>
-                  {sellPlan.routeKind === "fallback_pool_swap" ? (
-                    <span className="text-[15px] font-medium text-zinc-400">—</span>
-                  ) : (
-                    <>
-                      <span className="text-[1.125rem] font-semibold tabular-nums tracking-tight text-zinc-50">
-                        {formatUsdcAtomsHuman(sellPlan.usdcOutAtoms)}
+                <div className="space-y-1.5 text-right">
+                  <p className="text-[10px] text-zinc-500">
+                    Route:{" "}
+                    <span className="font-mono text-zinc-400">
+                      {sellPlan.routeKind}
+                    </span>
+                  </p>
+                  <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
+                    <span className="text-[11px] font-medium tracking-wide text-zinc-500">
+                      Est. USDC (exit route)
+                    </span>
+                    {sellPlan.routeKind === "fallback_pool_swap" ? (
+                      <span className="max-w-full text-right text-[10px] text-amber-200/80">
+                        No USDC — {sellPlan.uiSummary}
                       </span>
-                      <Image
-                        src="/Circle_USDC_Logo.png"
-                        alt=""
-                        width={22}
-                        height={22}
-                        className="h-[22px] w-[22px] shrink-0 rounded-full"
-                      />
-                    </>
-                  )}
+                    ) : (
+                      <>
+                        <span className="text-[1.125rem] font-semibold tabular-nums tracking-tight text-zinc-50">
+                          {formatUsdcAtomsHuman(sellPlan.usdcOutAtoms)}
+                        </span>
+                        <Image
+                          src="/Circle_USDC_Logo.png"
+                          alt=""
+                          width={22}
+                          height={22}
+                          className="h-[22px] w-[22px] shrink-0 rounded-full"
+                        />
+                      </>
+                    )}
+                  </div>
                 </div>
               ) : null}
             </div>
@@ -848,12 +1196,21 @@ export function TradingPanel({
         />
       ) : null}
 
-      {isSell ? (
+      {showAnySellForm && !useDedicatedResolvedLayout ? (
         <MarketSellOutcomeButton
           market={market}
-          sellSide={outcome === "yes" ? "yes" : "no"}
+          sellSide={sideForSell}
           outcomeAmountHuman={outcomeAmount}
-          sellLabel={outcome === "yes" ? "Sell YES" : "Sell NO"}
+          sellLabel={
+            isResolved
+              ? sideForSell === "yes"
+                ? "Redeem YES"
+                : "Redeem NO"
+              : sideForSell === "yes"
+                ? "Sell YES"
+                : "Sell NO"
+          }
+          forResolutionRedeem={isResolved}
           onTradeSuccess={onSellSuccess}
           className={tradeButtonClass}
         />
@@ -883,9 +1240,17 @@ export function TradingPanel({
         </div>
       ) : null}
 
-      <p className="mt-3 text-center text-[10px] text-zinc-600">
-        Connect a wallet to load balances. Estimates are indicative.
-      </p>
+      {!useDedicatedResolvedLayout ? (
+        <p className="mt-3 text-center text-[10px] text-zinc-600">
+          Connect a wallet to load balances. Estimates are indicative.
+        </p>
+      ) : null}
+      </>
+      ) : (
+        <p className="rounded-lg border border-amber-500/25 bg-amber-950/30 px-3 py-2.5 text-[12px] leading-relaxed text-amber-100/95 ring-1 ring-amber-500/15">
+          Trading has ended. Resolution is in progress.
+        </p>
+      )}
     </div>
 
     </>

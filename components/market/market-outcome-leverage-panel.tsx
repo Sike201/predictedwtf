@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { memo, useCallback, useRef, useState } from "react";
 
 import { MarketLeverageSection } from "@/components/market/market-leverage-section";
 import { useWallet } from "@/lib/hooks/use-wallet";
@@ -14,11 +14,30 @@ type Props = {
   onAfterTx: (detail?: { signature?: string }) => void | Promise<void>;
 };
 
+function snapshotKey(snapshot: OmnipairUserPositionSnapshot | null): string {
+  if (snapshot == null) return "null";
+  return [
+    snapshot.userPositionPda ?? "",
+    snapshot.collateralYesAtoms,
+    snapshot.collateralNoAtoms,
+    snapshot.debtYesAtoms,
+    snapshot.debtNoAtoms,
+  ].join("|");
+}
+
+function marketOutcomeLeveragePropsEqual(prev: Props, next: Props): boolean {
+  if (prev.onAfterTx !== next.onAfterTx) return false;
+  if (prev.market.id !== next.market.id) return false;
+  if (prev.market.pool?.poolId !== next.market.pool?.poolId) return false;
+  if (snapshotKey(prev.snapshot) !== snapshotKey(next.snapshot)) return false;
+  return true;
+}
+
 /**
  * Outcome-token leverage only (wallet YES/NO collateral). Lives in the Trade
  * panel **Leverage** tab; spot buy/sell is Buy / Sell.
  */
-export function MarketOutcomeLeveragePanel({
+const MarketOutcomeLeveragePanelInner = function MarketOutcomeLeveragePanel({
   market,
   snapshot,
   onAfterTx,
@@ -28,6 +47,14 @@ export function MarketOutcomeLeveragePanel({
   const [positionWarningSig, setPositionWarningSig] = useState<string | null>(
     null,
   );
+
+  const sk = snapshotKey(snapshot);
+  const renderCountRef = useRef(0);
+  const prevPropsRef = useRef<{
+    snap: string;
+    marketId: string;
+    onAfter: Props["onAfterTx"];
+  } | null>(null);
 
   const pool = market.pool;
   const hasAnyOutcome =
@@ -89,6 +116,32 @@ export function MarketOutcomeLeveragePanel({
     );
   }
 
+  renderCountRef.current += 1;
+  if (process.env.NODE_ENV === "development") {
+    const p = prevPropsRef.current;
+    const changed: string[] = [];
+    if (p) {
+      if (p.snap !== sk) changed.push("snapshot");
+      if (p.marketId !== market.id) changed.push("marketId");
+      if (p.onAfter !== onAfterTx) changed.push("onAfterTx");
+    }
+    console.info(
+      "[predicted][leverage-refresh-debug]",
+      JSON.stringify({
+        cause: !p
+          ? "mount"
+          : changed.length
+            ? `props:${changed.join(",")}`
+            : "reconcile",
+        component: "MarketOutcomeLeveragePanel",
+        changedInputs: changed.length ? changed : undefined,
+        rerenderCount: renderCountRef.current,
+        inputs: { marketId: market.id, snapshotKey: sk },
+      }),
+    );
+    prevPropsRef.current = { snap: sk, marketId: market.id, onAfter: onAfterTx };
+  }
+
   const emptyNoOutcome =
     !balances.loading && balances.yesRaw <= 0n && balances.noRaw <= 0n;
   const loadingNoOutcome = balances.loading && !hasAnyOutcome;
@@ -126,4 +179,9 @@ export function MarketOutcomeLeveragePanel({
   );
 
   return <div className="space-y-2">{expandedBody}</div>;
-}
+};
+
+export const MarketOutcomeLeveragePanel = memo(
+  MarketOutcomeLeveragePanelInner,
+  marketOutcomeLeveragePropsEqual,
+);

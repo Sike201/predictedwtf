@@ -1,7 +1,9 @@
 "use client";
 
 import { motion } from "framer-motion";
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { withResolvedBinaryDisplay } from "@/lib/market/resolved-binary-prices";
 import { filterFeedMarkets } from "@/lib/data/filter-markets";
 import { MarketCard } from "@/components/markets/market-card";
 import { CategoryFilterBar } from "@/components/markets/category-filter-bar";
@@ -32,14 +34,14 @@ function mergeFeedEnrichOddsOnly(base: Market[], enriched: Market[]): Market[] {
       Number.isFinite(row.snapshot.volumeUsd)
         ? Math.max(0, row.snapshot.volumeUsd)
         : 0;
-    return {
+    return withResolvedBinaryDisplay({
       ...e,
       snapshot: {
         liquidityUsd:
           e.snapshot?.liquidityUsd ?? row.snapshot?.liquidityUsd ?? 0,
         volumeUsd,
       },
-    };
+    });
   });
 }
 
@@ -184,6 +186,14 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
         >
+          <div className="mb-3 flex flex-wrap items-center justify-end gap-2">
+            <Link
+              href="/resolved"
+              className="text-[11px] font-medium text-zinc-500 transition hover:text-zinc-300"
+            >
+              Resolved markets
+            </Link>
+          </div>
           <CategoryFilterBar
             sort={sort}
             category={category}

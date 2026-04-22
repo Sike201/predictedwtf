@@ -107,8 +107,20 @@ export async function sellWalletOutcomesToUsdcAfterClose(params: {
       break;
     }
 
+    const resolvedTo =
+      market.resolution.status === "resolved" &&
+      (market.resolution.resolvedOutcome === "yes" ||
+        market.resolution.resolvedOutcome === "no")
+        ? market.resolution.resolvedOutcome
+        : null;
+
     let side: "yes" | "no";
-    if (yesRaw > ty && noRaw > tn) {
+    if (resolvedTo) {
+      const wthr = resolvedTo === "yes" ? ty : tn;
+      const wraw = resolvedTo === "yes" ? yesRaw : noRaw;
+      if (wraw <= wthr) break;
+      side = resolvedTo;
+    } else if (yesRaw > ty && noRaw > tn) {
       side = closedTrack;
     } else if (yesRaw > ty) {
       side = "yes";

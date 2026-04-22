@@ -6,15 +6,22 @@ import { useRouter } from "next/navigation";
 import { useEffect, useRef } from "react";
 import type { Market } from "@/lib/types/market";
 import { fmtUsdCompactVol } from "@/components/markets/animated-volume";
+import { usePendingVolumeDelta } from "@/lib/hooks/use-pending-volume-delta";
 import { FEED_TILE_CLASS } from "@/lib/constants/feed-layout";
 import { cn } from "@/lib/utils/cn";
 
 function CardMeta({ market }: { market: Market }) {
   const incoming = market.snapshot?.volumeUsd;
-  const vol =
+  const serverVol =
     typeof incoming === "number" && Number.isFinite(incoming)
       ? Math.max(0, incoming)
       : 0;
+  const pending = usePendingVolumeDelta(
+    market.id,
+    serverVol,
+    market.lastStatsUpdatedAt,
+  );
+  const vol = serverVol + pending;
   const renderedText = `${fmtUsdCompactVol(vol)} vol`;
 
   const volumeUiPrev = useRef<number | undefined>(undefined);
@@ -27,7 +34,7 @@ function CardMeta({ market }: { market: Market }) {
       volumeAfter: vol,
     });
     volumeUiPrev.current = vol;
-  }, [market.id, vol]);
+  }, [market.id, pending, serverVol, vol]);
 
   return (
     <div className="flex shrink-0 items-center border-t border-white/[0.04] px-2.5 py-2 text-[10px] text-zinc-400 sm:px-3 sm:text-[11px]">
@@ -286,6 +293,8 @@ export function MarketCard({ market }: MarketCardProps) {
     }).catch(() => {});
   };
 
+  const lifecycle = market.resolution.status;
+
   return (
     <article className={cn("min-h-0", FEED_TILE_CLASS)}>
       <Link
@@ -295,6 +304,19 @@ export function MarketCard({ market }: MarketCardProps) {
         className="flex h-full min-h-0 flex-col overflow-hidden rounded-2xl bg-[#111] ring-1 ring-white/[0.05] transition-colors duration-200 hover:bg-[#161616]"
       >
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          {lifecycle === "resolving" ? (
+            <div className="shrink-0 border-b border-amber-500/15 bg-amber-500/10 px-2.5 py-1.5 sm:px-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-amber-100/95">
+                Resolving
+              </span>
+            </div>
+          ) : lifecycle === "resolved" ? (
+            <div className="shrink-0 border-b border-emerald-500/20 bg-emerald-500/10 px-2.5 py-1.5 sm:px-3">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-emerald-100/95">
+                Resolved
+              </span>
+            </div>
+          ) : null}
           <CardContentArea market={market} />
           <CardMeta market={market} />
         </div>

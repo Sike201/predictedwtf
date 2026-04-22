@@ -1,3 +1,7 @@
+import {
+  formatMarketEndTimeIsoForDatabase,
+  resolveMarketExpiryInputForDatabase,
+} from "@/lib/market/utc-instant";
 import type { MarketDraft } from "@/lib/types/market";
 
 /** Parsed Grok JSON from MARKET_VALIDATION_SYSTEM_PROMPT. */
@@ -18,16 +22,18 @@ export interface GrokValidationJson {
   needs_revision?: boolean;
 }
 
-function normalizeExpiry(expiryIso: string | undefined): string {
-  const s = expiryIso?.trim();
-  if (!s) return new Date(Date.now() + 365 * 864e5).toISOString();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return `${s}T23:59:59.000Z`;
-  try {
-    const d = new Date(s);
-    return Number.isNaN(d.getTime()) ? new Date(Date.now() + 365 * 864e5).toISOString() : d.toISOString();
-  } catch {
-    return new Date(Date.now() + 365 * 864e5).toISOString();
-  }
+function expiryForDraftFromGrok(
+  expiryIso: string | undefined,
+  userPrompt: string,
+  grokTitle: string,
+): string {
+  const raw = expiryIso?.trim() ?? "";
+  const titleBlock = [userPrompt, grokTitle].filter(Boolean).join("\n");
+  const resolved = resolveMarketExpiryInputForDatabase({
+    draftExpiry: raw,
+    title: titleBlock,
+  });
+  return formatMarketEndTimeIsoForDatabase(resolved.finalInput);
 }
 
 export function grokValidationToMarketDraft(
@@ -36,7 +42,11 @@ export function grokValidationToMarketDraft(
 ): MarketDraft {
   const title = parsed.title?.trim() || fallback.question;
   const description = parsed.description?.trim() || fallback.description;
-  const expiry = normalizeExpiry(parsed.expiry_iso);
+  const expiry = expiryForDraftFromGrok(
+    parsed.expiry_iso,
+    fallback.question,
+    title,
+  );
 
   const ruleLines = [
     parsed.yes_condition?.trim() && `YES: ${parsed.yes_condition.trim()}`,

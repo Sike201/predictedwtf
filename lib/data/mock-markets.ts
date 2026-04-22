@@ -1,9 +1,54 @@
-import type { Market } from "@/lib/types/market";
+import { computeMarketLifecycle } from "@/lib/market/market-lifecycle";
+import { TRUSTED_RESOLVER_ADDRESS } from "@/lib/market/trusted-resolver";
+import type { MarketRecord } from "@/lib/types/market-record";
+import type { Market, Resolution } from "@/lib/types/market";
 
 const demoImg = (seed: string) =>
   `https://picsum.photos/seed/${encodeURIComponent(seed)}/640/360`;
 
-export const MOCK_MARKETS: Market[] = [
+type LegacyMarket = Omit<Market, "resolution" | "resolverPubkey"> & {
+  resolution: Partial<Resolution> & Pick<Resolution, "rules" | "source" | "resolverWallet">;
+  resolverPubkey?: string;
+};
+
+function normalizeMockMarket(m: LegacyMarket): Market {
+  const rw = m.resolution.resolverWallet || TRUSTED_RESOLVER_ADDRESS;
+  const resolveAfter = m.resolution.resolveAfter ?? m.expiry;
+  const res: Resolution = {
+    ...m.resolution,
+    status: m.resolution.status ?? "active",
+    resolveAfter,
+    resolverWallet: rw,
+  };
+  const dbStatus: "active" | "resolved" =
+    res.status === "resolved" ? "resolved" : "active";
+  const partial: Pick<
+    MarketRecord,
+    "slug" | "status" | "resolution_status" | "resolve_after" | "expiry_ts"
+  > = {
+    slug: m.id,
+    status: m.phase === "raising" ? "creating" : "live",
+    resolution_status: dbStatus as MarketRecord["resolution_status"],
+    resolve_after: resolveAfter,
+    expiry_ts: m.expiry,
+  };
+  const { lifecycle, phase: computed } = computeMarketLifecycle(
+    partial as MarketRecord,
+    Date.now(),
+    m.id,
+  );
+  return {
+    ...m,
+    phase: m.phase === "raising" ? "raising" : computed,
+    resolverPubkey: m.resolverPubkey ?? rw,
+    resolution: {
+      ...res,
+      status: lifecycle,
+    },
+  };
+}
+
+const MOCK_MARKETS_RAW: LegacyMarket[] = [
   {
     id: "sol-300-jul-2026",
     question: "Will SOL reach $300 before July 2026?",
@@ -430,6 +475,8 @@ export const MOCK_MARKETS: Market[] = [
     chartSeries: buildSeries(0.6, 0.67),
   },
 ];
+
+export const MOCK_MARKETS: Market[] = MOCK_MARKETS_RAW.map(normalizeMockMarket);
 
 function buildSeries(from: number, to: number) {
   const points = 48;

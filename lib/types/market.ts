@@ -26,7 +26,7 @@ export type MarketSortKey = "trending" | "new" | "ending-soon";
 /** Right row: topic chip. */
 export type MarketCategoryKey = "all" | MarketTopic;
 
-export type MarketPhase = "raising" | "trading" | "resolved";
+export type MarketPhase = "raising" | "trading" | "resolving" | "resolved";
 
 export type OutcomeSide = "yes" | "no";
 
@@ -58,10 +58,20 @@ export interface RaiseRound {
   initialLiquidityUsd: number;
 }
 
+/**
+ * UI lifecycle: `resolving` is when `resolve_after` has passed but DB `resolution_status`
+ * is still `active` (waiting for the trusted resolver). `resolved` is after outcome is set.
+ */
+export type MarketLifecycleStatus = "active" | "resolving" | "resolved";
+
 export interface Resolution {
   rules: string;
   source: string;
+  /** Trusted resolver (base58). */
   resolverWallet: string;
+  status: MarketLifecycleStatus;
+  /** Earliest time resolution is allowed — ISO. Defaults to `expiry` in DB. */
+  resolveAfter: string;
   resolvedOutcome?: OutcomeSide;
   resolvedAt?: string;
 }
@@ -88,6 +98,8 @@ export interface Market {
   expiry: string;
   phase: MarketPhase;
   snapshot: MarketSnapshot;
+  /** Same as `resolution.resolverWallet` (convenience for UI / logs). */
+  resolverPubkey: string;
   resolution: Resolution;
   pool?: OmnipairPoolParams;
   raise?: RaiseRound;

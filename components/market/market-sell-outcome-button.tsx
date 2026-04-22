@@ -21,6 +21,8 @@ type MarketSellOutcomeButtonProps = {
   sellSide: SellOutcomeSide;
   outcomeAmountHuman: string;
   sellLabel: string;
+  /** When the market is resolved, logs `redeem_attempt` for MVP analytics. */
+  forResolutionRedeem?: boolean;
   onTradeSuccess?: (args: {
     signature: string;
     sellSide: SellOutcomeSide;
@@ -55,7 +57,8 @@ function formatSellError(e: unknown): string {
 }
 
 /**
- * USDC-native sell: server builds optional Omnipair rebalance + paired burn + custody USDC to user.
+ * USDC-native sell: server builds Omnipair rebalance + paired burn + custody USDC, or
+ * post-resolution direct custody redemption (no AMM) when the market is settled.
  */
 export function MarketSellOutcomeButton({
   className,
@@ -63,6 +66,7 @@ export function MarketSellOutcomeButton({
   sellSide,
   outcomeAmountHuman,
   sellLabel,
+  forResolutionRedeem,
   onTradeSuccess,
 }: MarketSellOutcomeButtonProps) {
   const router = useRouter();
@@ -113,6 +117,12 @@ export function MarketSellOutcomeButton({
     }
 
     try {
+      if (forResolutionRedeem) {
+        console.info("[predicted][resolve]", "redeem_attempt", {
+          marketSlug: market.id,
+          sellSide,
+        });
+      }
       console.info("[predicted][sell-volume-trace]", {
         step: "sell_click",
         marketSlug: market.id,
@@ -230,6 +240,7 @@ export function MarketSellOutcomeButton({
     connect,
     connected,
     connection,
+    forResolutionRedeem,
     market,
     onTradeSuccess,
     outcomeAmountHuman,

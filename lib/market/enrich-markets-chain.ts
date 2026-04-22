@@ -1,6 +1,10 @@
 import { PublicKey } from "@solana/web3.js";
 
 import { deriveMarketProbabilityFromPoolState } from "@/lib/market/derive-market-probability";
+import {
+  getResolvedBinaryDisplayPrices,
+  withResolvedBinaryDisplay,
+} from "@/lib/market/resolved-binary-prices";
 import type { Market } from "@/lib/types/market";
 import { getConnection } from "@/lib/solana/connection";
 import {
@@ -46,7 +50,7 @@ async function enrichOneMarketPoolSpotOnly(market: Market): Promise<Market> {
     };
   } catch (e) {
     console.warn(LOG, "spot-only failed", market.id, e);
-    return market;
+    return withResolvedBinaryDisplay(market);
   }
 }
 
@@ -110,16 +114,16 @@ async function enrichOneMarketOnChainSwapVolume(market: Market): Promise<Market>
       });
     }
 
-    return {
+    return withResolvedBinaryDisplay({
       ...market,
       snapshot: {
         ...market.snapshot,
         volumeUsd,
       },
-    };
+    });
   } catch (e) {
     console.warn(LOG, "on-chain swap volume failed", market.id, e);
-    return market;
+    return withResolvedBinaryDisplay(market);
   }
 }
 
@@ -154,7 +158,7 @@ export async function enrichMarketsOnChainSwapVolume(
 
 async function enrichOneMarketFull(market: Market): Promise<Market> {
   if (!market.pool?.poolId || !market.pool.yesMint || !market.pool.noMint) {
-    return market;
+    return withResolvedBinaryDisplay(market);
   }
 
   const connection = getConnection();
@@ -162,6 +166,24 @@ async function enrichOneMarketFull(market: Market): Promise<Market> {
     const pair = new PublicKey(market.pool.poolId);
     const yes = new PublicKey(market.pool.yesMint);
     const no = new PublicKey(market.pool.noMint);
+
+    if (getResolvedBinaryDisplayPrices(market)) {
+      const stats = await fetchPoolTotalSwapVolumeUsdWithStats(connection, {
+        pairAddress: pair,
+        yesMint: yes,
+        noMint: no,
+      });
+      const volumeUsd = Number.isFinite(stats.volumeUsd)
+        ? Math.max(0, stats.volumeUsd)
+        : 0;
+      return withResolvedBinaryDisplay({
+        ...market,
+        snapshot: {
+          ...market.snapshot,
+          volumeUsd,
+        },
+      });
+    }
 
     const [stats, poolState] = await Promise.all([
       fetchPoolTotalSwapVolumeUsdWithStats(connection, {
@@ -196,7 +218,7 @@ async function enrichOneMarketFull(market: Market): Promise<Market> {
     };
   } catch (e) {
     console.warn(LOG, market.id, e);
-    return market;
+    return withResolvedBinaryDisplay(market);
   }
 }
 

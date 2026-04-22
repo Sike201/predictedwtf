@@ -1,6 +1,8 @@
 /** Supabase `markets` row (prediction market lifecycle). */
 export type MarketStatus = "creating" | "live" | "failed";
 
+export type MarketResolutionStatus = "active" | "resolved";
+
 export interface MarketRecord {
   id: string;
   slug: string;
@@ -14,6 +16,11 @@ export interface MarketRecord {
   yes_condition: string;
   no_condition: string;
   expiry_ts: string;
+  /** When the trusted resolver may settle (MVP: matches `expiry_ts` for new markets). */
+  resolve_after: string;
+  resolution_status: MarketResolutionStatus;
+  resolved_outcome: string | null;
+  resolved_at: string | null;
   image_cid?: string | null;
   yes_mint: string | null;
   no_mint: string | null;

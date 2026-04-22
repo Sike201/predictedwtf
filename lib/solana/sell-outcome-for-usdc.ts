@@ -48,7 +48,9 @@ export type SellOutcomeSide = "yes" | "no";
 export type SellRouteKind =
   | "full_usdc_exit"
   | "partial_usdc_exit"
-  | "fallback_pool_swap";
+  | "fallback_pool_swap"
+  /** Post-resolution: burn winning leg only, USDC from custody at mint parity (no AMM). */
+  | "resolved_winner_redeem";
 
 export type SellOutcomeForUsdcBuildLog = {
   lastValidBlockHeight: number;
@@ -69,6 +71,8 @@ export type SellOutcomeForUsdcBuildLog = {
   pairedBurnOutcomeAtoms: string;
   /** Eligible paired burn before custody clamp (for debugging). */
   eligiblePairedBurnOutcomeAtoms: string;
+  /** Custody USDC (atoms) that caps paired burn → USDC. */
+  custodyUsdcAtoms: string;
   usdcOutAtoms: string;
   rebalanceSwapAmountIn: string;
   leftoverYesAtoms: string;
@@ -80,6 +84,8 @@ export type SellOutcomeForUsdcBuildLog = {
   uiSummary: string;
   computeBudgetMicroLamports?: number;
   custodyOwner?: string;
+  /** Resolved settlement only: atoms burned on the winning mint. */
+  winningBurnOutcomeAtoms?: string;
 };
 
 function logSell(tag: string, payload: Record<string, unknown>) {
@@ -317,6 +323,7 @@ export type SellOutcomePlan = Pick<
   | "requestedCapOutcomeAtoms"
   | "eligiblePairedBurnOutcomeAtoms"
   | "pairedBurnOutcomeAtoms"
+  | "custodyUsdcAtoms"
   | "usdcOutAtoms"
   | "rebalanceSwapAmountIn"
   | "leftoverYesAtoms"
@@ -324,6 +331,7 @@ export type SellOutcomePlan = Pick<
   | "fallbackSwapAmountIn"
   | "fallbackOppositeMinOut"
   | "uiSummary"
+  | "winningBurnOutcomeAtoms"
 >;
 
 /**
@@ -343,6 +351,7 @@ export async function planSellOutcomeForUsdc(
     requestedCapOutcomeAtoms: log.requestedCapOutcomeAtoms,
     eligiblePairedBurnOutcomeAtoms: log.eligiblePairedBurnOutcomeAtoms,
     pairedBurnOutcomeAtoms: log.pairedBurnOutcomeAtoms,
+    custodyUsdcAtoms: log.custodyUsdcAtoms,
     usdcOutAtoms: log.usdcOutAtoms,
     rebalanceSwapAmountIn: log.rebalanceSwapAmountIn,
     leftoverYesAtoms: log.leftoverYesAtoms,
@@ -350,6 +359,7 @@ export async function planSellOutcomeForUsdc(
     fallbackSwapAmountIn: log.fallbackSwapAmountIn,
     fallbackOppositeMinOut: log.fallbackOppositeMinOut,
     uiSummary: log.uiSummary,
+    winningBurnOutcomeAtoms: log.winningBurnOutcomeAtoms,
   };
 }
 
@@ -774,6 +784,7 @@ async function computeSellOutcomeCore(params: {
     requestedCapOutcomeAtoms: cap.toString(),
     eligiblePairedBurnOutcomeAtoms: eligiblePairedBurnOutcomeAtomsStr,
     pairedBurnOutcomeAtoms: pairedBurn.toString(),
+    custodyUsdcAtoms: custodyUsdcBal.toString(),
     usdcOutAtoms: usdcOut.toString(),
     rebalanceSwapAmountIn:
       routeKind === "fallback_pool_swap"

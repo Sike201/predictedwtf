@@ -41,6 +41,7 @@ export async function fetchLiveMarketsForFeed(): Promise<Market[]> {
     .from("markets")
     .select("*")
     .eq("status", "live")
+    .neq("resolution_status", "resolved")
     .order("created_at", { ascending: false });
 
   if (error) {
@@ -94,4 +95,31 @@ export async function fetchLiveMarketBySlug(
   }
 
   return data as MarketRecord | null;
+}
+
+/** Settled markets — archive / history (newest resolution first). */
+export async function fetchResolvedMarketsForArchive(
+  limit = 100,
+): Promise<Market[]> {
+  const sb = getSupabaseAdmin();
+  if (!sb) {
+    console.warn(`${LP} Supabase not configured — empty archive`);
+    return [];
+  }
+
+  const { data, error } = await sb
+    .from("markets")
+    .select("*")
+    .eq("status", "live")
+    .eq("resolution_status", "resolved")
+    .order("resolved_at", { ascending: false, nullsFirst: false })
+    .limit(Math.min(500, Math.max(1, limit)));
+
+  if (error) {
+    console.error(`${LP} archive query failed`, error.message);
+    return [];
+  }
+
+  const rows = (data ?? []) as MarketRecord[];
+  return rows.map((row, i) => marketRecordToMarket(row, i));
 }

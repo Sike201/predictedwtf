@@ -1,6 +1,7 @@
 /**
  * Unwind an Omnipair leveraged YES/NO position: optional AMM swap to source debt token,
- * then `repay` full debt on that leg, then `remove_collateral` on the posted collateral leg.
+ * then `repay` up to min(wallet balance, position debt) on that leg (avoids InsufficientBalance
+ * when wallet is a few atoms short of recorded debt), then `remove_collateral` on the collateral leg.
  */
 import {
   ComputeBudgetProgram,
@@ -18,6 +19,12 @@ import {
   buildRepayInstruction,
   OMNIPAIR_U64_MAX,
 } from "@/lib/solana/omnipair-lending-instructions";
+
+const REPAY_ADJUSTED_LOG = "[predicted][repay-adjusted]";
+
+function minBig(a: bigint, b: bigint): bigint {
+  return a < b ? a : b;
+}
 import {
   getAssociatedTokenAddressForMint,
   resolveSplTokenProgramForMint,
@@ -140,6 +147,9 @@ export async function buildCloseLeveragedYesPositionTransaction(params: {
   const debtNo = snap.debtNoAtoms;
   const collYes = snap.collateralYesAtoms;
 
+  /** NO tokens available in wallet for repay, after the optional pre-swap (if any). */
+  let noWalletForRepay = noBal;
+
   if (debtNo === 0n && collYes === 0n) {
     throw new Error("Nothing to close — no debt and no YES collateral in the lending position.");
   }
@@ -180,6 +190,7 @@ export async function buildCloseLeveragedYesPositionTransaction(params: {
     preSwapInYes = swapInYes;
     const est = estOut(swapInYes);
     const minOutSwap = applySlippageFloor(est, params.slippageBps);
+    noWalletForRepay = noBal + minOutSwap;
     tx.add(
       buildOmnipairSwapInstruction({
         programId,
@@ -198,19 +209,32 @@ export async function buildCloseLeveragedYesPositionTransaction(params: {
   }
 
   if (debtNo > 0n) {
-    tx.add(
-      buildRepayInstruction({
-        programId,
-        pair: params.pairAddress,
-        rateModel: pairDecoded.rateModel,
-        userPosition,
-        reserveVault: reserveNoVault,
-        userReserveAta: noAta,
-        reserveMint: params.noMint,
-        user: params.user,
-        amount: OMNIPAIR_U64_MAX,
+    const repayNoAtoms = minBig(debtNo, noWalletForRepay);
+    console.info(
+      REPAY_ADJUSTED_LOG,
+      JSON.stringify({
+        direction: "yes",
+        walletBalance: noWalletForRepay.toString(),
+        debtAtoms: debtNo.toString(),
+        repayAtoms: repayNoAtoms.toString(),
+        hadPreSwap,
       }),
     );
+    if (repayNoAtoms > 0n) {
+      tx.add(
+        buildRepayInstruction({
+          programId,
+          pair: params.pairAddress,
+          rateModel: pairDecoded.rateModel,
+          userPosition,
+          reserveVault: reserveNoVault,
+          userReserveAta: noAta,
+          reserveMint: params.noMint,
+          user: params.user,
+          amount: repayNoAtoms,
+        }),
+      );
+    }
   }
 
   if (collYes > 0n) {
@@ -320,6 +344,8 @@ export async function buildCloseLeveragedNoPositionTransaction(params: {
   const debtYes = snap.debtYesAtoms;
   const collNo = snap.collateralNoAtoms;
 
+  let yesWalletForRepay = yesBal;
+
   if (debtYes === 0n && collNo === 0n) {
     throw new Error("Nothing to close — no debt and no NO collateral on this position.");
   }
@@ -359,6 +385,7 @@ export async function buildCloseLeveragedNoPositionTransaction(params: {
     preSwapInNo = swapInNo;
     const est = estOut(swapInNo);
     const minOutSwap = applySlippageFloor(est, params.slippageBps);
+    yesWalletForRepay = yesBal + minOutSwap;
     tx.add(
       buildOmnipairSwapInstruction({
         programId,
@@ -377,19 +404,32 @@ export async function buildCloseLeveragedNoPositionTransaction(params: {
   }
 
   if (debtYes > 0n) {
-    tx.add(
-      buildRepayInstruction({
-        programId,
-        pair: params.pairAddress,
-        rateModel: pairDecoded.rateModel,
-        userPosition,
-        reserveVault: reserveYesVault,
-        userReserveAta: yesAta,
-        reserveMint: params.yesMint,
-        user: params.user,
-        amount: OMNIPAIR_U64_MAX,
+    const repayYesAtoms = minBig(debtYes, yesWalletForRepay);
+    console.info(
+      REPAY_ADJUSTED_LOG,
+      JSON.stringify({
+        direction: "no",
+        walletBalance: yesWalletForRepay.toString(),
+        debtAtoms: debtYes.toString(),
+        repayAtoms: repayYesAtoms.toString(),
+        hadPreSwap,
       }),
     );
+    if (repayYesAtoms > 0n) {
+      tx.add(
+        buildRepayInstruction({
+          programId,
+          pair: params.pairAddress,
+          rateModel: pairDecoded.rateModel,
+          userPosition,
+          reserveVault: reserveYesVault,
+          userReserveAta: yesAta,
+          reserveMint: params.yesMint,
+          user: params.user,
+          amount: repayYesAtoms,
+        }),
+      );
+    }
   }
 
   if (collNo > 0n) {

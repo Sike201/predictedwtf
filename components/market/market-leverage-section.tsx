@@ -1271,7 +1271,7 @@ export function MarketLeverageSection({
                 "disabled:cursor-not-allowed disabled:opacity-40",
               )}
             >
-              Max − 0.01
+              Max leverage
             </button>
           </div>
         ) : connected &&

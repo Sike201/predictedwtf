@@ -10,6 +10,10 @@ import {
   isOneSidedLiquidity,
 } from "@/lib/market/derive-market-probability";
 import { logOmnipairPoolSnapshot } from "@/lib/market/pool-state-debug";
+import {
+  getResolvedBinaryDisplayPrices,
+  logResolvedPricingOverride,
+} from "@/lib/market/resolved-binary-prices";
 import type { Market } from "@/lib/types/market";
 import type { OmnipairPoolChainState } from "@/lib/solana/read-omnipair-pool-state";
 import { readOmnipairPoolState } from "@/lib/solana/read-omnipair-pool-state";
@@ -52,6 +56,10 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
     useState<DerivedMarketProbability | null>(null);
   const [refreshEpoch, setRefreshEpoch] = useState(0);
   const mounted = useRef(true);
+  const resolvedLogKeyRef = useRef<string | null>(null);
+  /** Stabilize `refresh` identity — parent `market` can get a new object reference on a timer without any logical change, which was re-firing the initial effect and re-fetching the pool repeatedly. */
+  const marketRef = useRef(market);
+  marketRef.current = market;
 
   useEffect(() => {
     mounted.current = true;
@@ -62,6 +70,48 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
 
   const refresh = useCallback(
     async (reason = "refresh") => {
+      const m = marketRef.current;
+      const resolvedPx = getResolvedBinaryDisplayPrices(m);
+      if (resolvedPx) {
+        const logKey = `${marketId}:${resolvedPx.winningOutcome}`;
+        if (resolvedLogKeyRef.current !== logKey) {
+          resolvedLogKeyRef.current = logKey;
+          logResolvedPricingOverride({
+            slug: m.id,
+            winningOutcome: resolvedPx.winningOutcome,
+            finalYesPrice: resolvedPx.yes,
+            finalNoPrice: resolvedPx.no,
+          });
+        }
+        if (mounted.current) {
+          setUnavailable(false);
+          setOneSidedLiquidity(false);
+          setYes(resolvedPx.yes);
+          setNo(resolvedPx.no);
+          setChainSnapshot(null);
+          setDerivedSnapshot(null);
+          setLoading(false);
+          setRefreshEpoch((n) => n + 1);
+        }
+        if (process.env.NODE_ENV === "development") {
+          console.info(
+            "[predicted][pool-prices-render]",
+            JSON.stringify({
+              phase: reason,
+              reserveYes: null,
+              reserveNo: null,
+              computedYesPrice: resolvedPx.yes,
+              computedNoPrice: resolvedPx.no,
+              finalDisplayedYesPrice: resolvedPx.yes,
+              finalDisplayedNoPrice: resolvedPx.no,
+              note: "resolved_binary_override",
+            }),
+          );
+        }
+        return;
+      }
+      resolvedLogKeyRef.current = null;
+
       if (!poolId || !yesMintId || !noMintId) {
         if (process.env.NODE_ENV === "development") {
           console.info(

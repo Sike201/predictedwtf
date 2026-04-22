@@ -7,7 +7,14 @@ import {
 } from "@/lib/solana/mint-market-positions";
 import { getConnection } from "@/lib/solana/connection";
 import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
+import {
+  isMarketRecordResolved,
+  isMarketRowBlockedForNewBuys,
+  MARKET_RESOLVED_TRADING_ERROR,
+  MARKET_RESOLVING_TRADING_ERROR,
+} from "@/lib/market/market-trading-blocked";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
+import type { MarketRecord } from "@/lib/types/market-record";
 
 export const runtime = "nodejs";
 
@@ -62,13 +69,25 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,yes_mint,no_mint",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint",
       )
       .eq("slug", slug)
       .maybeSingle();
 
     if (error || !row) {
       return NextResponse.json({ error: "Market not found" }, { status: 404 });
+    }
+
+    const rec = row as MarketRecord;
+    if (isMarketRowBlockedForNewBuys(rec)) {
+      return NextResponse.json(
+        {
+          error: isMarketRecordResolved(row)
+            ? MARKET_RESOLVED_TRADING_ERROR
+            : MARKET_RESOLVING_TRADING_ERROR,
+        },
+        { status: 400 },
+      );
     }
 
     if (row.status !== "live" || !row.yes_mint || !row.no_mint) {

@@ -164,7 +164,7 @@ RETURN JSON ONLY
 
   "description": "short explanation of the event",
 
-  "expiry_iso": "YYYY-MM-DD",
+  "expiry_iso": "YYYY-MM-DD or YYYY-MM-DDTHH:MM:00.000Z",
 
   "subject": "main entity of prediction",
 
@@ -224,9 +224,11 @@ The user may specify dates in natural language formats such as:
 
 Your task is to interpret the user's intended deadline and convert it into ISO format.
 
-The output must ALWAYS include:
+The output must ALWAYS include the field "expiry_iso" as a UTC instant:
 
-expiry_iso: "YYYY-MM-DD"
+- If the user only names a calendar day (no time), use: "expiry_iso": "YYYY-MM-DD".
+- If the user names a specific UTC time (e.g. "before 12:55 UTC", "by 3:00 PM UTC" converted to 24h UTC), use a full instant: "expiry_iso": "YYYY-MM-DDTHH:MM:00.000Z".
+  Do not collapse a time-specific market to date-only, or the end will be wrong.
 
 Example:
 

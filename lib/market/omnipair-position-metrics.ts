@@ -1,3 +1,4 @@
+import { getResolvedBinaryDisplayPrices } from "@/lib/market/resolved-binary-prices";
 import type { Market } from "@/lib/types/market";
 
 const DEV_LOG = "[predicted][position-metrics][dev]";
@@ -27,7 +28,7 @@ const DEV_LOG = "[predicted][position-metrics][dev]";
  * shown as primary because it diverges from the “× vs deposit” notion used at open.
  */
 export type OmnipairPositionMetricsUsd = {
-  priceSource: "spot_reserves" | "market_pool";
+  priceSource: "resolved_payout" | "spot_reserves" | "market_pool";
   impliedYes: number;
   impliedNo: number;
   collateralValueUsd: number;
@@ -53,7 +54,19 @@ export type PriceInput = {
 export function resolveImpliedPrices(
   market: Market,
   spot: PriceInput,
-): { impliedYes: number; impliedNo: number; priceSource: "spot_reserves" | "market_pool" } {
+): {
+  impliedYes: number;
+  impliedNo: number;
+  priceSource: "resolved_payout" | "spot_reserves" | "market_pool";
+} {
+  const resolved = getResolvedBinaryDisplayPrices(market);
+  if (resolved) {
+    return {
+      impliedYes: resolved.yes,
+      impliedNo: resolved.no,
+      priceSource: "resolved_payout",
+    };
+  }
   const sy = spot.spotYesProbability;
   const sn = spot.spotNoProbability;
   if (

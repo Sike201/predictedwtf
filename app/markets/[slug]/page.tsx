@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 import { MarketDetailView } from "@/components/market/market-detail-view";
 import { fetchLiveMarketBySlug } from "@/lib/market/fetch-markets";
 import { fetchMarketPriceHistoryPoints } from "@/lib/market/market-price-history";
+import { logMarketTraceServer } from "@/lib/market/detail-trading-surface";
 import { marketRecordToMarket } from "@/lib/market/market-record-adapter";
 
 export const dynamic = "force-dynamic";
@@ -16,6 +17,13 @@ export default async function MarketBySlugPage({ params }: PageProps) {
   if (!record) notFound();
 
   const base = marketRecordToMarket(record, 0);
+  const tTrace = Date.now();
+  logMarketTraceServer({
+    where: "app/markets/[slug]/page.tsx",
+    record,
+    market: base,
+    nowMs: tTrace,
+  });
   const chartFetchedAt = Date.now();
   const chartPoints = await fetchMarketPriceHistoryPoints(decodeURIComponent(slug));
   const initialChartHistory = chartPoints.map(({ t, p }) => ({ t, p }));

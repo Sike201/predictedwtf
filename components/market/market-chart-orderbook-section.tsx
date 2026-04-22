@@ -9,6 +9,7 @@ import {
   evenTimeTicks,
   xAxisTickCountForRange,
 } from "@/lib/chart/time-series-path";
+import { getResolvedBinaryDisplayPrices } from "@/lib/market/resolved-binary-prices";
 import type { Market } from "@/lib/types/market";
 import { cn } from "@/lib/utils/cn";
 
@@ -18,6 +19,7 @@ const CHART_TF_LOG = "[predicted][chart-timeframe]";
 const CHART_SERIES_LOG = "[predicted][chart-series]";
 const CHART_TIME_PLACEMENT_LOG = "[predicted][chart-time-placement]";
 const CHART_HYDRATE = "[predicted][chart-hydrate]";
+const RESOLVED_CHART_CLAMP_LOG = "[predicted][resolved-chart-clamp]";
 
 type MainTab = "chart" | "orderbook";
 
@@ -164,16 +166,77 @@ export function MarketChartOrderbookSection({
     return () => window.clearInterval(id);
   }, []);
 
-  /** Chronological order — required for window split (anchor = last trade before cut). */
-  const normalizedHistory = useMemo(() => {
+  const resolvedDisplay = useMemo(
+    () => getResolvedBinaryDisplayPrices(market),
+    [market],
+  );
+  const resolvedAtMs = useMemo(() => {
+    const raw = market.resolution.resolvedAt;
+    if (raw == null) return Number.NaN;
+    const t = Date.parse(String(raw));
+    return Number.isFinite(t) && t > 0 ? t : Number.NaN;
+  }, [market.resolution.resolvedAt]);
+
+  /**
+   * Chronological order. When resolved: drop any post-`resolvedAt` DB rows, then
+   * append a single terminal point at `resolvedAt` with YES = 0 or 1 (no live bounces after).
+   */
+  const { normalizedHistory, resolvedChartClamp } = useMemo(() => {
     const out: { t: number; p: number }[] = [];
     for (const raw of cachedSeries) {
       const n = normalizeHistoryPoint(raw);
       if (n) out.push(n);
     }
     out.sort((a, b) => a.t - b.t);
-    return out;
-  }, [cachedSeries]);
+    if (!resolvedDisplay || !Number.isFinite(resolvedAtMs) || resolvedAtMs <= 0) {
+      return { normalizedHistory: out, resolvedChartClamp: null };
+    }
+    const removedPostResolutionPointsCount = out.filter(
+      (p) => p.t > resolvedAtMs,
+    ).length;
+    const before = out.filter((p) => p.t < resolvedAtMs);
+    const finalP = resolvedDisplay.yes;
+    const merged = [...before, { t: resolvedAtMs, p: finalP }].sort(
+      (a, b) => a.t - b.t,
+    );
+    return {
+      normalizedHistory: merged,
+      resolvedChartClamp: {
+        removedPostResolutionPointsCount,
+        finalClampedValue: finalP,
+        resolvedAt: String(market.resolution.resolvedAt),
+        resolvedOutcome: resolvedDisplay.winningOutcome,
+      },
+    };
+  }, [cachedSeries, market.resolution.resolvedAt, resolvedAtMs, resolvedDisplay]);
+
+  const lastResolvedClampKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!resolvedChartClamp) {
+      lastResolvedClampKey.current = null;
+      return;
+    }
+    const key = [
+      market.id,
+      resolvedChartClamp.resolvedAt,
+      String(resolvedChartClamp.finalClampedValue),
+      String(resolvedChartClamp.removedPostResolutionPointsCount),
+    ].join("\0");
+    if (lastResolvedClampKey.current === key) return;
+    lastResolvedClampKey.current = key;
+    console.info(
+      RESOLVED_CHART_CLAMP_LOG,
+      JSON.stringify({
+        slug: market.id,
+        resolvedOutcome: resolvedChartClamp.resolvedOutcome,
+        resolvedAt: resolvedChartClamp.resolvedAt,
+        finalClampedValue: resolvedChartClamp.finalClampedValue,
+        removedPostResolutionPointsCount:
+          resolvedChartClamp.removedPostResolutionPointsCount,
+        liveTailSuppressed: true,
+      }),
+    );
+  }, [market.id, resolvedChartClamp]);
 
   const earliestHistoryPointTs = useMemo(() => {
     if (normalizedHistory.length === 0) return null;
@@ -241,8 +304,18 @@ export function MarketChartOrderbookSection({
 
   const renderYesPrice =
     useLive && liveYesProbability != null ? liveYesProbability : yesP;
+  const chartEndYesPrice = useMemo(
+    () =>
+      resolvedDisplay != null
+        ? resolvedDisplay.yes
+        : (renderYesPrice as number),
+    [renderYesPrice, resolvedDisplay],
+  );
   const canAppendLiveTail =
-    Number.isFinite(renderYesPrice) && renderYesPrice >= 0 && renderYesPrice <= 1;
+    !resolvedDisplay &&
+    Number.isFinite(renderYesPrice) &&
+    renderYesPrice >= 0 &&
+    renderYesPrice <= 1;
 
   const chartRenderSeries: ChartRenderPoint[] = useMemo(() => {
     if (notEnoughRecentTrades) return [];
@@ -271,7 +344,7 @@ export function MarketChartOrderbookSection({
       return base;
     }
 
-    const y = renderYesPrice as number;
+    const y = chartEndYesPrice;
     let tailT = Date.now();
     const last = base[base.length - 1];
     if (last && tailT <= last.t) {
@@ -284,7 +357,7 @@ export function MarketChartOrderbookSection({
     inWindowHistory,
     notEnoughRecentTrades,
     canAppendLiveTail,
-    renderYesPrice,
+    chartEndYesPrice,
     range,
     normalizedHistory.length,
     chartClock,
@@ -315,7 +388,7 @@ export function MarketChartOrderbookSection({
         points: chartHistoryPointsForPath,
         startMs,
         endMs: domainEnd,
-        endPrice: renderYesPrice as number,
+        endPrice: chartEndYesPrice,
       });
       const span = domainEnd - startMs;
       const tickCount = xAxisTickCountForRange("ALL", span);
@@ -339,7 +412,7 @@ export function MarketChartOrderbookSection({
       points: chartHistoryPointsForPath,
       startMs,
       endMs,
-      endPrice: renderYesPrice as number,
+      endPrice: chartEndYesPrice,
     });
     const span = endMs - startMs;
     const tickCount = xAxisTickCountForRange(range, span);
@@ -353,12 +426,12 @@ export function MarketChartOrderbookSection({
     };
   }, [
     chartHistoryPointsForPath,
+    chartEndYesPrice,
     createdAtMs,
     earliestHistoryPointTs,
     notEnoughRecentTrades,
     normalizedHistory,
     range,
-    renderYesPrice,
     windowMsForRange,
     chartClock,
     liveRefreshEpoch,
@@ -410,7 +483,7 @@ export function MarketChartOrderbookSection({
     const hist = chartHistoryPointsForPath;
     const latestH = hist.length > 0 ? hist[hist.length - 1]! : null;
     const liveTailTs = chartPathPrep.xDomain.maxT;
-    const liveTailPrice = renderYesPrice as number;
+    const liveTailPrice = chartEndYesPrice;
     const lastTwo = pathSeries.slice(-2);
     const latestTradeCollapsedIntoNow =
       pathSeries.length >= 2 &&
@@ -440,9 +513,9 @@ export function MarketChartOrderbookSection({
   }, [
     chartHistoryPointsForPath,
     chartPathPrep,
+    chartEndYesPrice,
     market.id,
     range,
-    renderYesPrice,
   ]);
 
   const chartDebugRef = useRef<string | null>(null);

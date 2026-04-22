@@ -1,7 +1,7 @@
 "use client";
 
 import { useConnection } from "@solana/wallet-adapter-react";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, Transaction } from "@solana/web3.js";
 import { ExternalLink } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -24,6 +24,14 @@ import {
   readWalletOutcomeSnapshot,
   walletOutcomeReturnDelta,
 } from "@/lib/market/close-position-wallet-delta";
+import { getResolvedBinaryDisplayPrices } from "@/lib/market/resolved-binary-prices";
+import {
+  estimateAtResolutionPayoutMark,
+  logLeverageSettlementResult,
+  logLeverageSettlementStart,
+  shouldUseLeverageSettlement,
+} from "@/lib/market/resolved-leverage-settlement";
+import { buildDebtBridgeShortfallDetails } from "@/lib/market/leverage-debt-bridge";
 import { isDuplicateSolanaSubmitError } from "@/lib/market/solana-submit-errors";
 import {
   buildCloseLeveragedNoPositionTransaction,
@@ -37,6 +45,8 @@ import { cn } from "@/lib/utils/cn";
 
 const SLIPPAGE_BPS = 150;
 const CLOSE_LOG = "[predicted][your-position-close]";
+const BRIDGE_CALC_LOG = "[predicted][leverage-debt-bridge-calc]";
+const BRIDGE_TX_LOG = "[predicted][leverage-debt-bridge-tx]";
 
 const actionBtnClass =
   "rounded-md border border-white/[0.12] px-2 py-1 text-[10px] font-medium text-zinc-200 transition hover:border-white/[0.2] hover:bg-white/[0.04] disabled:cursor-not-allowed disabled:opacity-40";
@@ -80,7 +90,19 @@ export function YourPositionPanel({
     walletNoAfterHuman: string;
     walletUsdcAfterHuman: string;
   } | null>(null);
+  const [lastSettledOnResolution, setLastSettledOnResolution] = useState(false);
   const closeInFlightRef = useRef(false);
+  const bridgeInFlightRef = useRef(false);
+  const bridgeTouched = useRef({ yes: false, no: false });
+  const [bridgeUsdcByDir, setBridgeUsdcByDir] = useState<{
+    yes: string;
+    no: string;
+  }>({ yes: "", no: "" });
+  const [bridgeBusy, setBridgeBusy] = useState(false);
+  const [bridgeError, setBridgeError] = useState<string | null>(null);
+  const settleYesBtnRef = useRef<HTMLButtonElement>(null);
+  const settleNoBtnRef = useRef<HTMLButtonElement>(null);
+  const settleSingleBtnRef = useRef<HTMLButtonElement>(null);
 
   const pool = market.pool;
   const pairAddress = useMemo(
@@ -104,6 +126,179 @@ export function YourPositionPanel({
     snapshot &&
     (BigInt(snapshot.collateralNoAtoms) > 0n ||
       BigInt(snapshot.debtYesAtoms) > 0n);
+
+  const useSettlementCta = shouldUseLeverageSettlement(market, snapshot);
+
+  const yesTrackBridge = useMemo(() => {
+    if (!useSettlementCta || !snapshot || !hasYesTrack) return null;
+    const d = buildDebtBridgeShortfallDetails("yes", {
+      debtYesAtoms: BigInt(snapshot.debtYesAtoms),
+      debtNoAtoms: BigInt(snapshot.debtNoAtoms),
+      yesWalletAtoms: balances.yesRaw,
+      noWalletAtoms: balances.noRaw,
+    });
+    const dec =
+      d.debtToken === "yes" ? balances.yesDecimals : balances.noDecimals;
+    return {
+      ...d,
+      shortfall: d.tokenShortfallOutcomeAtoms,
+      minUsdcBaseUnits: d.minUsdcBaseUnits,
+      minUsdcHuman: formatBaseUnitsToDecimalString(
+        d.minUsdcBaseUnits,
+        6,
+        6,
+      ),
+      shortfallHuman: formatBaseUnitsToDecimalString(
+        d.tokenShortfallOutcomeAtoms,
+        dec,
+        6,
+      ),
+      debtOwedHuman: formatBaseUnitsToDecimalString(
+        d.debtTokenOwedAtoms,
+        dec,
+        6,
+      ),
+      walletDebtTokenHuman: formatBaseUnitsToDecimalString(
+        d.debtTokenWalletAtoms,
+        dec,
+        6,
+      ),
+    };
+  }, [
+    useSettlementCta,
+    snapshot,
+    hasYesTrack,
+    balances.yesRaw,
+    balances.noRaw,
+    balances.yesDecimals,
+    balances.noDecimals,
+  ]);
+
+  const noTrackBridge = useMemo(() => {
+    if (!useSettlementCta || !snapshot || !hasNoTrack) return null;
+    const d = buildDebtBridgeShortfallDetails("no", {
+      debtYesAtoms: BigInt(snapshot.debtYesAtoms),
+      debtNoAtoms: BigInt(snapshot.debtNoAtoms),
+      yesWalletAtoms: balances.yesRaw,
+      noWalletAtoms: balances.noRaw,
+    });
+    const dec =
+      d.debtToken === "yes" ? balances.yesDecimals : balances.noDecimals;
+    return {
+      ...d,
+      shortfall: d.tokenShortfallOutcomeAtoms,
+      minUsdcBaseUnits: d.minUsdcBaseUnits,
+      minUsdcHuman: formatBaseUnitsToDecimalString(
+        d.minUsdcBaseUnits,
+        6,
+        6,
+      ),
+      shortfallHuman: formatBaseUnitsToDecimalString(
+        d.tokenShortfallOutcomeAtoms,
+        dec,
+        6,
+      ),
+      debtOwedHuman: formatBaseUnitsToDecimalString(
+        d.debtTokenOwedAtoms,
+        dec,
+        6,
+      ),
+      walletDebtTokenHuman: formatBaseUnitsToDecimalString(
+        d.debtTokenWalletAtoms,
+        dec,
+        6,
+      ),
+    };
+  }, [
+    useSettlementCta,
+    snapshot,
+    hasNoTrack,
+    balances.yesRaw,
+    balances.noRaw,
+    balances.yesDecimals,
+    balances.noDecimals,
+  ]);
+
+  useEffect(() => {
+    if (!yesTrackBridge || yesTrackBridge.shortfall === 0n) {
+      bridgeTouched.current.yes = false;
+      setBridgeUsdcByDir((p) => ({ ...p, yes: "" }));
+      return;
+    }
+    if (!bridgeTouched.current.yes) {
+      setBridgeUsdcByDir((p) => ({ ...p, yes: yesTrackBridge.minUsdcHuman }));
+    }
+  }, [yesTrackBridge]);
+
+  useEffect(() => {
+    if (!noTrackBridge || noTrackBridge.shortfall === 0n) {
+      bridgeTouched.current.no = false;
+      setBridgeUsdcByDir((p) => ({ ...p, no: "" }));
+      return;
+    }
+    if (!bridgeTouched.current.no) {
+      setBridgeUsdcByDir((p) => ({ ...p, no: noTrackBridge.minUsdcHuman }));
+    }
+  }, [noTrackBridge]);
+
+  useEffect(() => {
+    if (!yesTrackBridge || yesTrackBridge.shortfall === 0n) return;
+    console.info(
+      BRIDGE_CALC_LOG,
+      JSON.stringify({
+        slug: market.id,
+        track: "yes" as const,
+        closeDirection: yesTrackBridge.closeDirection,
+        debtToken: yesTrackBridge.debtToken,
+        debtTokenOwedAtoms: yesTrackBridge.debtTokenOwedAtoms.toString(),
+        debtTokenWalletAtoms: yesTrackBridge.debtTokenWalletAtoms.toString(),
+        tokenShortfallOutcomeAtoms:
+          yesTrackBridge.tokenShortfallOutcomeAtoms.toString(),
+        ceilingDivisor: yesTrackBridge.ceilingDivisor.toString(),
+        minUsdcBaseUnits: yesTrackBridge.minUsdcBaseUnits.toString(),
+        minUsdcHuman: yesTrackBridge.minUsdcHuman,
+        source: "client",
+      }),
+    );
+  }, [yesTrackBridge, market.id]);
+
+  useEffect(() => {
+    if (!noTrackBridge || noTrackBridge.shortfall === 0n) return;
+    console.info(
+      BRIDGE_CALC_LOG,
+      JSON.stringify({
+        slug: market.id,
+        track: "no" as const,
+        closeDirection: noTrackBridge.closeDirection,
+        debtToken: noTrackBridge.debtToken,
+        debtTokenOwedAtoms: noTrackBridge.debtTokenOwedAtoms.toString(),
+        debtTokenWalletAtoms: noTrackBridge.debtTokenWalletAtoms.toString(),
+        tokenShortfallOutcomeAtoms:
+          noTrackBridge.tokenShortfallOutcomeAtoms.toString(),
+        ceilingDivisor: noTrackBridge.ceilingDivisor.toString(),
+        minUsdcBaseUnits: noTrackBridge.minUsdcBaseUnits.toString(),
+        minUsdcHuman: noTrackBridge.minUsdcHuman,
+        source: "client",
+      }),
+    );
+  }, [noTrackBridge, market.id]);
+
+  const resolvedPayout = getResolvedBinaryDisplayPrices(market);
+  const resolutionSettlement = useMemo(() => {
+    if (!useSettlementCta || !snapshot) return null;
+    return estimateAtResolutionPayoutMark({
+      market,
+      snapshot,
+      yesDecimals: balances.yesDecimals,
+      noDecimals: balances.noDecimals,
+    });
+  }, [
+    market,
+    snapshot,
+    useSettlementCta,
+    balances.yesDecimals,
+    balances.noDecimals,
+  ]);
 
   const [openedAtLeverageApprox, setOpenedAtLeverageApprox] = useState<number | null>(
     null,
@@ -176,6 +371,7 @@ export function YourPositionPanel({
       closeInFlightRef.current = true;
       setActionError(null);
       setLastCloseDetail(null);
+      setLastSettledOnResolution(false);
       if (!connected || !publicKey || !signTransaction || !pairAddress || !yesMint || !noMint) {
         setActionError("Connect a wallet.");
         closeInFlightRef.current = false;
@@ -185,6 +381,30 @@ export function YourPositionPanel({
       try {
         if (process.env.NODE_ENV === "development") {
           console.info(CLOSE_LOG, "close_click", JSON.stringify({ which }));
+        }
+        const forSettlement = shouldUseLeverageSettlement(market, snapshot);
+        let settlementEst: ReturnType<typeof estimateAtResolutionPayoutMark> | null =
+          null;
+        if (
+          forSettlement &&
+          snapshot &&
+          snapshot.userPositionPda &&
+          publicKey &&
+          (market.resolution.resolvedOutcome === "yes" ||
+            market.resolution.resolvedOutcome === "no")
+        ) {
+          settlementEst = estimateAtResolutionPayoutMark({
+            market,
+            snapshot,
+            yesDecimals: balances.yesDecimals,
+            noDecimals: balances.noDecimals,
+          });
+          logLeverageSettlementStart({
+            slug: market.id,
+            winningOutcome: market.resolution.resolvedOutcome,
+            userPositionId: snapshot.userPositionPda,
+            wallet: publicKey.toBase58(),
+          });
         }
         const built =
           which === "yes"
@@ -250,6 +470,26 @@ export function YourPositionPanel({
         );
         if (process.env.NODE_ENV === "development") {
           console.info(CLOSE_LOG, "tx_confirmed", JSON.stringify({ signature: sig }));
+        }
+        if (
+          forSettlement &&
+          settlementEst &&
+          snapshot &&
+          snapshot.userPositionPda &&
+          publicKey &&
+          (market.resolution.resolvedOutcome === "yes" ||
+            market.resolution.resolvedOutcome === "no")
+        ) {
+          logLeverageSettlementResult({
+            slug: market.id,
+            winningOutcome: market.resolution.resolvedOutcome,
+            userPositionId: snapshot.userPositionPda,
+            wallet: publicKey.toBase58(),
+            finalUserValue: settlementEst.equityUsd,
+            debtNet: settlementEst.debtValueUsd,
+            collateralNet: settlementEst.collateralValueUsd,
+          });
+          setLastSettledOnResolution(true);
         }
 
         await new Promise((r) => setTimeout(r, 400));
@@ -335,6 +575,180 @@ export function YourPositionPanel({
       connected,
       yesMint,
       noMint,
+      market,
+      snapshot,
+      balances.yesDecimals,
+      balances.noDecimals,
+    ],
+  );
+
+  const runDebtBridge = useCallback(
+    async (closeDirection: "yes" | "no") => {
+      if (bridgeInFlightRef.current) {
+        console.info(
+          BRIDGE_TX_LOG,
+          JSON.stringify({
+            slug: market.id,
+            closeDirection,
+            action: "ignored_concurrent",
+          }),
+        );
+        return;
+      }
+      if (!connected || !publicKey || !signTransaction) {
+        setBridgeError("Connect a wallet.");
+        return;
+      }
+      const usdc = (
+        closeDirection === "yes" ? bridgeUsdcByDir.yes : bridgeUsdcByDir.no
+      ).trim();
+      const info = closeDirection === "yes" ? yesTrackBridge : noTrackBridge;
+      if (!info || info.shortfall === 0n) return;
+      bridgeInFlightRef.current = true;
+      setBridgeError(null);
+      setBridgeBusy(true);
+      try {
+        console.info(
+          BRIDGE_TX_LOG,
+          JSON.stringify({
+            slug: market.id,
+            closeDirection,
+            action: "build_fetch_start",
+            shortfallOutcomeAtoms: info.shortfall.toString(),
+            usdcAmountHuman: usdc,
+          }),
+        );
+        const r = await fetch("/api/market/mint-positions-debt-bridge", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            slug: market.id,
+            userWallet: publicKey.toBase58(),
+            closeDirection,
+            usdcAmountHuman: usdc,
+          }),
+        });
+        const j = (await r.json()) as { error?: string; transaction?: string };
+        if (!r.ok) {
+          throw new Error(
+            j.error ?? "Could not build repay-bridge transaction",
+          );
+        }
+        if (!j.transaction) {
+          throw new Error("Missing transaction in response");
+        }
+        const tx = Transaction.from(Buffer.from(j.transaction, "base64"));
+        const { blockhash, lastValidBlockHeight } =
+          await connection.getLatestBlockhash("confirmed");
+        tx.feePayer = publicKey;
+        tx.recentBlockhash = blockhash;
+        const signed = await signTransaction(tx);
+        const raw = signed.serialize();
+        console.info(
+          BRIDGE_TX_LOG,
+          JSON.stringify({
+            slug: market.id,
+            closeDirection,
+            action: "send_raw_tx",
+            serializedBytes: raw.length,
+          }),
+        );
+        const sig = await connection.sendRawTransaction(raw, {
+          skipPreflight: false,
+          maxRetries: 0,
+        });
+        console.info(
+          BRIDGE_TX_LOG,
+          JSON.stringify({
+            slug: market.id,
+            closeDirection,
+            action: "sent",
+            signature: sig,
+          }),
+        );
+        await connection.confirmTransaction(
+          { signature: sig, blockhash, lastValidBlockHeight },
+          "confirmed",
+        );
+        console.info(
+          BRIDGE_TX_LOG,
+          JSON.stringify({
+            slug: market.id,
+            closeDirection,
+            action: "confirmed",
+            signature: sig,
+          }),
+        );
+        if (closeDirection === "yes") {
+          bridgeTouched.current.yes = false;
+        } else {
+          bridgeTouched.current.no = false;
+        }
+        balances.refresh();
+        onPositionTxSettled?.({ signature: sig });
+        requestAnimationFrame(() => {
+          if (hasYesTrack && hasNoTrack) {
+            if (closeDirection === "yes") {
+              settleYesBtnRef.current?.focus();
+            } else {
+              settleNoBtnRef.current?.focus();
+            }
+          } else {
+            settleSingleBtnRef.current?.focus();
+          }
+        });
+      } catch (e) {
+        const m = e instanceof Error ? e.message : "Bridge mint failed";
+        if (isDuplicateSolanaSubmitError(m)) {
+          setBridgeError(
+            "This transaction may have already confirmed. Refreshing your balances and position…",
+          );
+          if (closeDirection === "yes") {
+            bridgeTouched.current.yes = false;
+          } else {
+            bridgeTouched.current.no = false;
+          }
+          balances.refresh();
+          onPositionTxSettled?.();
+          console.info(
+            BRIDGE_TX_LOG,
+            JSON.stringify({
+              slug: market.id,
+              closeDirection,
+              action: "duplicate_or_already_processed",
+              message: m,
+            }),
+          );
+        } else {
+          setBridgeError(m);
+          console.warn(
+            BRIDGE_TX_LOG,
+            JSON.stringify({
+              slug: market.id,
+              closeDirection,
+              action: "error",
+              message: m,
+            }),
+          );
+        }
+      } finally {
+        bridgeInFlightRef.current = false;
+        setBridgeBusy(false);
+      }
+    },
+    [
+      connected,
+      publicKey,
+      signTransaction,
+      connection,
+      market.id,
+      bridgeUsdcByDir,
+      yesTrackBridge,
+      noTrackBridge,
+      balances,
+      onPositionTxSettled,
+      hasYesTrack,
+      hasNoTrack,
     ],
   );
 
@@ -346,6 +760,21 @@ export function YourPositionPanel({
     }
   }, [hasNoTrack, hasYesTrack, runClose]);
 
+  const yesSettleBlockedByDebt =
+    Boolean(
+      useSettlementCta && yesTrackBridge && yesTrackBridge.shortfall > 0n,
+    );
+  const noSettleBlockedByDebt =
+    Boolean(
+      useSettlementCta && noTrackBridge && noTrackBridge.shortfall > 0n,
+    );
+  const singleSettleBlockedByDebt =
+    hasYesTrack && !hasNoTrack
+      ? yesSettleBlockedByDebt
+      : hasNoTrack && !hasYesTrack
+        ? noSettleBlockedByDebt
+        : false;
+
   if (!pool?.poolId) return null;
 
   const positionActions =
@@ -354,39 +783,64 @@ export function YourPositionPanel({
         {hasYesTrack && hasNoTrack ? (
           <>
             <button
+              ref={settleYesBtnRef}
               type="button"
-              disabled={busy || !connected}
+              disabled={
+                busy || !connected || yesSettleBlockedByDebt
+              }
               onClick={() => void runClose("yes")}
-              title="Repay debt and unlock YES-track collateral; outcome tokens return to your wallet."
+              title={
+                yesSettleBlockedByDebt
+                  ? "Mint YES+NO from USDC first to cover the NO debt, then settle."
+                  : useSettlementCta
+                    ? "Repay and unlock this leg at resolved prices."
+                    : "Repay debt and unlock YES collateral into your wallet."
+              }
               className={actionBtnClass}
             >
-              {busy ? "…" : "Close YES"}
+              {busy ? "…" : useSettlementCta ? "Settle YES" : "Close YES"}
             </button>
             <button
+              ref={settleNoBtnRef}
               type="button"
-              disabled={busy || !connected}
+              disabled={busy || !connected || noSettleBlockedByDebt}
               onClick={() => void runClose("no")}
-              title="Repay debt and unlock NO-track collateral; outcome tokens return to your wallet."
+              title={
+                noSettleBlockedByDebt
+                  ? "Mint YES+NO from USDC first to cover the YES debt, then settle."
+                  : useSettlementCta
+                    ? "Repay and unlock this leg at resolved prices."
+                    : "Repay debt and unlock NO collateral into your wallet."
+              }
               className={actionBtnClass}
             >
-              {busy ? "…" : "Close NO"}
+              {busy ? "…" : useSettlementCta ? "Settle NO" : "Close NO"}
             </button>
           </>
         ) : (
           <button
+            ref={settleSingleBtnRef}
             type="button"
-            disabled={busy || !connected || (!hasYesTrack && !hasNoTrack)}
+            disabled={
+              busy || !connected || (!hasYesTrack && !hasNoTrack) || singleSettleBlockedByDebt
+            }
             onClick={() => void onClosePosition()}
-            title="Repay debt and unlock collateral; unwound YES/NO returns to your wallet — not USDC."
+            title={
+              singleSettleBlockedByDebt
+                ? "Mint YES+NO from USDC to cover the debt gap, then settle."
+                : useSettlementCta
+                  ? "Settle at resolved prices. You receive outcome tokens, not USDC."
+                  : "Repay debt and unlock collateral as outcome tokens."
+            }
             className={actionBtnClass}
           >
-            {busy ? "…" : "Close position"}
+            {busy ? "…" : useSettlementCta ? "Settle position" : "Close position"}
           </button>
         )}
         <button
           type="button"
           disabled
-          title="Reduce leverage — not available in-app yet."
+          title="Coming soon"
           className="rounded-md px-2 py-1 text-[10px] font-medium text-zinc-600"
         >
           Reduce
@@ -422,6 +876,183 @@ export function YourPositionPanel({
         <p className="mt-3 text-[11px] text-amber-200/90">{error}</p>
       ) : snapshot?.userPositionPda ? (
         <>
+          {useSettlementCta && resolvedPayout && resolutionSettlement ? (
+            <div className="mt-3 space-y-2 rounded-md border border-emerald-500/25 bg-emerald-500/[0.05] p-2.5 text-[10px] text-zinc-200">
+              <p className="text-[9px] font-semibold uppercase tracking-wide text-emerald-400/90">
+                Resolved
+              </p>
+              <p>
+                <span className="text-zinc-500">Winner </span>
+                <span className="font-semibold text-zinc-100">
+                  {resolvedPayout.winningOutcome === "yes" ? "YES" : "NO"}
+                </span>
+              </p>
+              <p className="text-zinc-400">
+                Est. equity at resolution{" "}
+                <span className="tabular-nums font-medium text-zinc-100">
+                  {formatUsd(resolutionSettlement.equityUsd)}
+                </span>
+              </p>
+              <p className="text-zinc-500">
+                Collateral {formatUsd(resolutionSettlement.collateralValueUsd)} ·
+                Debt {formatUsd(resolutionSettlement.debtValueUsd)}
+              </p>
+            </div>
+          ) : null}
+          {useSettlementCta &&
+          snapshot &&
+          hasActiveLendingPosition(snapshot) &&
+          ((yesTrackBridge && yesTrackBridge.shortfall > 0n) ||
+            (noTrackBridge && noTrackBridge.shortfall > 0n)) && (
+            <div className="mt-3 space-y-3 rounded-md border border-amber-500/30 bg-amber-500/[0.06] p-2.5 text-[10px] text-zinc-200">
+              <p className="text-[9px] font-semibold uppercase tracking-wide text-amber-400/90">
+                Top up to settle
+              </p>
+              <p className="leading-relaxed text-zinc-300">
+                You need a bit more of the debt token in your wallet. Mint a
+                paired YES+NO set from USDC, use the right leg to cover the gap,
+                then settle. The USDC line is the minimum to mint that cover,
+                not a separate debt to the pool.
+              </p>
+              <p className="text-zinc-400">
+                This is the USDC to route through the mint so you can finish
+                repayment.
+              </p>
+              {yesTrackBridge && yesTrackBridge.shortfall > 0n && hasYesTrack ? (
+                <div className="space-y-1.5 rounded border border-white/[0.08] bg-black/20 p-2">
+                  <p className="text-[9px] font-medium text-zinc-400">
+                    Settle YES · repay{" "}
+                    <span className="text-zinc-200">
+                      {yesTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                    </span>
+                  </p>
+                  <dl className="space-y-1 text-[9px] text-zinc-400">
+                    <div className="flex justify-between gap-2">
+                      <dt>Owed</dt>
+                      <dd className="tabular-nums text-zinc-200">
+                        {yesTrackBridge.debtOwedHuman}{" "}
+                        {yesTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>In wallet</dt>
+                      <dd className="tabular-nums text-zinc-200">
+                        {yesTrackBridge.walletDebtTokenHuman}{" "}
+                        {yesTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Short</dt>
+                      <dd className="tabular-nums text-zinc-200">
+                        {yesTrackBridge.shortfallHuman}{" "}
+                        {yesTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Min USDC to mint</dt>
+                      <dd className="tabular-nums text-amber-100/90">
+                        {yesTrackBridge.minUsdcHuman} USDC
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="flex flex-col gap-1.5 sm:flex-row sm:items-end">
+                    <label className="flex min-w-0 flex-1 flex-col gap-0.5 text-[9px] text-zinc-500">
+                      <span>USDC {yesTrackBridge.minUsdcHuman} min</span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={bridgeUsdcByDir.yes}
+                        onChange={(e) => {
+                          bridgeTouched.current.yes = true;
+                          setBridgeUsdcByDir((p) => ({
+                            ...p,
+                            yes: e.target.value,
+                          }));
+                        }}
+                        className="rounded border border-white/[0.1] bg-black/30 px-2 py-1 text-[10px] text-zinc-100"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      disabled={bridgeBusy || !connected}
+                      onClick={() => void runDebtBridge("yes")}
+                      className={cn(actionBtnClass, "whitespace-nowrap border-amber-500/30")}
+                    >
+                      {bridgeBusy ? "…" : "Mint from USDC for repay"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              {noTrackBridge && noTrackBridge.shortfall > 0n && hasNoTrack ? (
+                <div className="space-y-1.5 rounded border border-white/[0.08] bg-black/20 p-2">
+                  <p className="text-[9px] font-medium text-zinc-400">
+                    Settle NO · repay{" "}
+                    <span className="text-zinc-200">
+                      {noTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                    </span>
+                  </p>
+                  <dl className="space-y-1 text-[9px] text-zinc-400">
+                    <div className="flex justify-between gap-2">
+                      <dt>Owed</dt>
+                      <dd className="tabular-nums text-zinc-200">
+                        {noTrackBridge.debtOwedHuman}{" "}
+                        {noTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>In wallet</dt>
+                      <dd className="tabular-nums text-zinc-200">
+                        {noTrackBridge.walletDebtTokenHuman}{" "}
+                        {noTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Short</dt>
+                      <dd className="tabular-nums text-zinc-200">
+                        {noTrackBridge.shortfallHuman}{" "}
+                        {noTrackBridge.debtToken === "yes" ? "YES" : "NO"}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Min USDC to mint</dt>
+                      <dd className="tabular-nums text-amber-100/90">
+                        {noTrackBridge.minUsdcHuman} USDC
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="flex flex-col gap-1.5 sm:flex-row sm:items-end">
+                    <label className="flex min-w-0 flex-1 flex-col gap-0.5 text-[9px] text-zinc-500">
+                      <span>USDC {noTrackBridge.minUsdcHuman} min</span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={bridgeUsdcByDir.no}
+                        onChange={(e) => {
+                          bridgeTouched.current.no = true;
+                          setBridgeUsdcByDir((p) => ({
+                            ...p,
+                            no: e.target.value,
+                          }));
+                        }}
+                        className="rounded border border-white/[0.1] bg-black/30 px-2 py-1 text-[10px] text-zinc-100"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      disabled={bridgeBusy || !connected}
+                      onClick={() => void runDebtBridge("no")}
+                      className={cn(actionBtnClass, "whitespace-nowrap border-amber-500/30")}
+                    >
+                      {bridgeBusy ? "…" : "Mint from USDC for repay"}
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+              {bridgeError ? (
+                <p className="text-[10px] text-amber-200/90">{bridgeError}</p>
+              ) : null}
+            </div>
+          )}
           {hasActiveLendingPosition(snapshot) && positionMetrics ? (
             <div className="mt-3">
               <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-[10px] sm:grid-cols-3 md:grid-cols-4">
@@ -493,10 +1124,21 @@ export function YourPositionPanel({
 
           {hasActiveLendingPosition(snapshot) ? (
             <p className="mt-2 text-[10px] leading-snug text-zinc-600">
-              <span className="text-zinc-500">Close position</span> repays debt and unlocks
-              collateral. Returned assets are sent to your wallet as{" "}
-              <span className="text-zinc-500">YES / NO</span> outcome tokens — not USDC. Use{" "}
-              <span className="text-zinc-500">Sell</span> if you want to convert to USDC.
+              {useSettlementCta ? (
+                <>
+                  <span className="text-zinc-500">Settle</span> repays and returns
+                  YES/NO to your wallet at resolved prices, not USDC. Cash out
+                  winners in the trade panel under{" "}
+                  <span className="text-zinc-500">Redeem</span>.
+                </>
+              ) : (
+                <>
+                  <span className="text-zinc-500">Close</span> repays and returns
+                  YES/NO to your wallet. Use{" "}
+                  <span className="text-zinc-500">Sell</span> to swap toward USDC
+                  if you want.
+                </>
+              )}
             </p>
           ) : null}
 
@@ -555,7 +1197,9 @@ export function YourPositionPanel({
           ) : null}
           {lastCloseDetail ? (
             <div className="mt-2 space-y-1.5 rounded-md border border-white/[0.06] bg-white/[0.02] p-2 text-[10px] text-zinc-400">
-              <p className="text-[9px] font-medium text-zinc-500">Position closed</p>
+              <p className="text-[9px] font-medium text-zinc-500">
+                {lastSettledOnResolution ? "Position settled" : "Position closed"}
+              </p>
               <p className="text-zinc-300">
                 <span className="text-zinc-500">Returned YES</span>{" "}
                 <span className="font-semibold tabular-nums text-zinc-100">

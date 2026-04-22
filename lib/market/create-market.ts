@@ -29,10 +29,19 @@ import {
   extractMissingProgramIdFromSolanaError,
   formatMissingDeployedProgramMessage,
 } from "@/lib/solana/trace-transaction-programs";
+import {
+  formatMarketEndTimeIsoForDatabase,
+  isDateOnlyUtcCalendarInput,
+  logMarketExpiryWrite,
+  resolveMarketExpiryInputForDatabase,
+} from "@/lib/market/utc-instant";
+import { classifyMarketCategoryWithGrok } from "@/lib/market/grok-classify-market-category";
+import { TRUSTED_RESOLVER_ADDRESS } from "@/lib/market/trusted-resolver";
 import type { MarketRecord, MarketStatus } from "@/lib/types/market-record";
 import type { MarketDraft } from "@/lib/types/market";
 
 const LP = "[predicted][pipeline]";
+const CREATE_LIFECYCLE_LOG = "[predicted][create-market-lifecycle]";
 
 function solanaPipelineStage(
   stage: PipelineFailureStage,
@@ -49,6 +58,7 @@ export type CreateMarketInput = {
   draft: MarketDraft;
   creatorWallet: string;
   resolverWallet?: string;
+  /** Ignored for storage; category is set by Grok from `draft.question` (fallback `predicted`). */
   category?: string;
   yesCondition?: string;
   noCondition?: string;
@@ -74,14 +84,6 @@ function makeSlug(title: string): string {
     .replace(/^-|-$/g, "")
     .slice(0, 48);
   return `${base || "market"}-${Date.now().toString(36)}`;
-}
-
-function parseExpiryIso(expiry: string): string {
-  const d = new Date(expiry);
-  if (Number.isNaN(d.getTime())) {
-    return new Date(Date.now() + 365 * 864e5).toISOString();
-  }
-  return d.toISOString();
 }
 
 function splitYesNo(draft: MarketDraft, yes?: string, no?: string) {
@@ -126,13 +128,11 @@ export async function createMarketPipeline(
     return { ok: false, error: "Invalid creator wallet address." };
   }
 
-  const resolver =
-    input.resolverWallet?.trim() || process.env.DEFAULT_RESOLVER_WALLET?.trim();
-  let resolverPk: PublicKey;
+  let trustedResolver: PublicKey;
   try {
-    resolverPk = resolver ? new PublicKey(resolver) : creator;
+    trustedResolver = new PublicKey(TRUSTED_RESOLVER_ADDRESS.trim());
   } catch {
-    return { ok: false, error: "Invalid resolver wallet address." };
+    return { ok: false, error: "Invalid TRUSTED_RESOLVER_ADDRESS configuration." };
   }
 
   const { yes, no } = splitYesNo(
@@ -141,8 +141,28 @@ export async function createMarketPipeline(
     input.noCondition,
   );
   const slug = makeSlug(input.draft.question);
-  const expiryTs = parseExpiryIso(input.draft.expiry);
-  const category = input.category?.trim() || "predicted";
+  const draftExpiryRaw = input.draft.expiry;
+  const expiryResolved = resolveMarketExpiryInputForDatabase({
+    draftExpiry: draftExpiryRaw,
+    title: input.draft.question,
+  });
+  const parsedBeforeFormat = expiryResolved.finalInput;
+  const expiryTs = formatMarketEndTimeIsoForDatabase(expiryResolved.finalInput);
+  const interpretedAsDateOnly = isDateOnlyUtcCalendarInput(draftExpiryRaw.trim());
+  logMarketExpiryWrite({
+    slug,
+    draft_expiry_input: draftExpiryRaw,
+    parsed_before_format: parsedBeforeFormat,
+    interpreted_as_date_only: interpretedAsDateOnly,
+    used_title_utc_time: expiryResolved.usedTitleUtcTime,
+    title_derived_cutoff: expiryResolved.titleDerivedCutoff,
+    final_expiry_ts: expiryTs,
+    final_resolve_after: expiryTs,
+  });
+  const category = await classifyMarketCategoryWithGrok({
+    question: input.draft.question,
+    slug,
+  });
 
   let imageCid: string | null = null;
   try {
@@ -169,15 +189,29 @@ export async function createMarketPipeline(
     description: input.draft.description,
     category,
     creator_wallet: creator.toBase58(),
-    resolver_wallet: resolverPk.toBase58(),
+    resolver_wallet: trustedResolver.toBase58(),
     resolution_source: input.draft.resolutionSource,
     resolution_rules: input.draft.resolutionRules,
     yes_condition: yes,
     no_condition: no,
     expiry_ts: expiryTs,
+    resolve_after: expiryTs,
+    resolution_status: "active" as const,
     status: "creating" as const,
     image_cid: imageCid,
   };
+  console.info(
+    CREATE_LIFECYCLE_LOG,
+    "row_before_insert",
+    JSON.stringify({
+      slug,
+      category,
+      draft_expiry_input: draftExpiryRaw,
+      derived_expiry_ts: expiryTs,
+      derived_resolve_after: expiryTs,
+      resolution_status: "active",
+    }),
+  );
 
   let inserted: { id: string };
   try {
@@ -192,11 +226,25 @@ export async function createMarketPipeline(
       throw new Error(insertErr?.message ?? "Failed to insert market draft.");
     }
     inserted = data as { id: string };
+    const insertedRow = data as MarketRecord;
     console.info(`${LP} market inserted with slug`, {
       slug,
       id: inserted.id,
       status: "creating",
     });
+    console.info(
+      CREATE_LIFECYCLE_LOG,
+      "insert_row",
+      JSON.stringify({
+        slug: insertedRow.slug,
+        draft_expiry_input: draftExpiryRaw,
+        expiry_ts: insertedRow.expiry_ts,
+        resolve_after: insertedRow.resolve_after,
+        resolution_status: insertedRow.resolution_status,
+        created_at: insertedRow.created_at,
+        status: insertedRow.status,
+      }),
+    );
   } catch (e) {
     const msg = formatUnknownError(e);
     console.error(`${LP} Supabase insert failed`, msg, e);
@@ -395,10 +443,24 @@ export async function createMarketPipeline(
       if (upErr || !live) {
         throw new Error(upErr?.message ?? "Failed to finalize market.");
       }
+      const liveRow = live as MarketRecord;
       console.info(`${LP} market updated to live`, {
         id: marketId,
-        slug: (live as MarketRecord).slug,
+        slug: liveRow.slug,
       });
+      console.info(
+        CREATE_LIFECYCLE_LOG,
+        "final_live_row",
+        JSON.stringify({
+          slug: liveRow.slug,
+          draft_expiry_input: draftExpiryRaw,
+          expiry_ts: liveRow.expiry_ts,
+          resolve_after: liveRow.resolve_after,
+          resolution_status: liveRow.resolution_status,
+          created_at: liveRow.created_at,
+          status: liveRow.status,
+        }),
+      );
 
       if (!mockChain) {
         const seedSig = seedTx ?? poolInitTx ?? createdTxSig;
