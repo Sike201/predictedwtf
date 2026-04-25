@@ -1,0 +1,47 @@
+{
+  "name": "predicted-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Predicted Omnipair GAMM prediction market layer on Solana (devnet-first).",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/predictedwtf/predictedwtf.git",
+    "directory": "packages/predicted-sdk"
+  },
+  "keywords": [
+    "solana",
+    "prediction-markets",
+    "omnipair",
+    "gamm"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": true,
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.95.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  }
+}
