@@ -15,7 +15,8 @@ type DerivedState = {
 
 /**
  * On-chain swap total for the market pool — same aggregation as incremental volume
- * (`parseSwapUsdMicrosFromTx` over paginated pair history), not the capped pool-activity table rows.
+ * (GAMM: `parseSwapUsdMicrosFromTx`; PM_AMM: USDC in/out over market PDA history),
+ * not the capped pool-activity table rows.
  */
 export function useDetailDerivedVolume(market: Market): {
   hasPool: boolean;
@@ -51,6 +52,10 @@ export function useDetailDerivedVolume(market: Market): {
         yesMint,
         noMint,
       });
+      if (market.engine === "PM_AMM" && market.collateralMint) {
+        qs.set("engine", "PM_AMM");
+        qs.set("collateralMint", market.collateralMint);
+      }
       const res = await fetch(`/api/market/swap-volume?${qs.toString()}`, {
         credentials: "same-origin",
       });
@@ -86,7 +91,7 @@ export function useDetailDerivedVolume(market: Market): {
     } finally {
       if (id === reqId.current) setLoading(false);
     }
-  }, [hasPool, poolId, yesMint, noMint]);
+  }, [hasPool, poolId, yesMint, noMint, market.engine, market.collateralMint]);
 
   useEffect(() => {
     void load();

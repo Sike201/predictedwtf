@@ -13,6 +13,7 @@ import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import { DEFAULT_OMNIPAIR_POOL_PARAMS } from "@/lib/solana/omnipair-params-hash";
 import { deriveOmnipairLayout } from "@/lib/solana/omnipair-pda";
 import { requireOmnipairProgramId } from "@/lib/solana/omnipair-program";
+import { readPmammMarketPoolSnapshot } from "@/lib/solana/pmamm-program";
 import { readOmnipairPoolState } from "@/lib/solana/read-omnipair-pool-state";
 import { extractPostTxOmnipairVaultReserves } from "@/lib/solana/omnipair-tx-post-reserves";
 import { fetchSingleTxTradeVolumeUsd } from "@/lib/solana/fetch-pool-onchain-activity";
@@ -223,16 +224,37 @@ async function commitMarketPriceSnapshotFromReserves(params: {
       : "duplicate_snapshot_row";
   } else if (isNewSnapshotRow) {
     try {
-      const detail = await fetchSingleTxTradeVolumeUsd(connection, {
+      let volFetchParams: Parameters<typeof fetchSingleTxTradeVolumeUsd>[1] = {
         signature: txSignature,
         yesMint,
         noMint,
-      });
+      };
+      const { data: meRow } = await sb
+        .from("markets")
+        .select("market_engine, usdc_mint")
+        .eq("id", marketId)
+        .maybeSingle();
+      const eng = (meRow as { market_engine?: string } | null)?.market_engine;
+      const um = (meRow as { usdc_mint?: string | null } | null)?.usdc_mint;
+      if (eng === "PM_AMM" && um) {
+        try {
+          volFetchParams = {
+            ...volFetchParams,
+            marketEngine: "PM_AMM",
+            collateralMint: new PublicKey(um),
+          };
+        } catch {
+          /* invalid usdc_mint */
+        }
+      }
+
+      const detail = await fetchSingleTxTradeVolumeUsd(connection, volFetchParams);
       volDelta = detail.volumeUsd;
       const parseSource = detail.source;
       const classifiedAsPoolSwapStyle =
         parseSource === "omnipair_swap_ix" ||
-        parseSource.startsWith("token_balance_");
+        parseSource.startsWith("token_balance_") ||
+        parseSource.startsWith("pmamm_swap");
       console.info("[predicted][buy-volume-trace] parsed_delta", {
         txSignature,
         marketRowId: marketId,
@@ -348,11 +370,69 @@ export async function recordMarketPriceSnapshotFromChain(params: {
   pairAddress: PublicKey;
   yesMint: PublicKey;
   noMint: PublicKey;
+  /** When set, skips DB lookup for `market_engine`. */
+  marketEngineHint?: string;
 }): Promise<
   { ok: true; volumeVerify: VolumeTradeVerify } | { ok: false; error: string }
 > {
   const { marketId, txSignature, connection, pairAddress, yesMint, noMint } =
     params;
+
+  let engine = params.marketEngineHint;
+  if (engine == null) {
+    const sb = getSupabaseAdmin();
+    if (!sb) {
+      return { ok: false, error: "Supabase not configured." };
+    }
+    const { data: engRow, error: engErr } = await sb
+      .from("markets")
+      .select("market_engine")
+      .eq("id", marketId)
+      .maybeSingle();
+    if (engErr) {
+      return { ok: false, error: engErr.message };
+    }
+    engine =
+      (engRow as { market_engine?: string } | null)?.market_engine ?? "GAMM";
+  }
+
+  if (engine === "PM_AMM") {
+    let pm;
+    try {
+      pm = await readPmammMarketPoolSnapshot(connection, pairAddress);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`${LP} read pmamm market failed`, marketId, msg);
+      logChartSnapshot("snapshot_upsert_fail", {
+        marketId,
+        txSignature,
+        phase: "read_pmamm_market",
+        error: msg,
+      });
+      logChartPersist("snapshot_upsert_fail", {
+        marketId,
+        txSignature,
+        phase: "read_pmamm_market",
+        error: msg,
+      });
+      return {
+        ok: false,
+        error: "PM_AMM market state unavailable. Refresh and try again.",
+      };
+    }
+    const snapshotMs = await resolveSnapshotTimeMs(connection, txSignature);
+    return commitMarketPriceSnapshotFromReserves({
+      marketId,
+      txSignature,
+      connection,
+      pairAddress,
+      yesMint,
+      noMint,
+      reserveYes: pm.reserveYes,
+      reserveNo: pm.reserveNo,
+      snapshotMs,
+    });
+  }
 
   let state;
   try {

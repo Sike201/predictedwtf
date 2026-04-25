@@ -1,3 +1,4 @@
+import { BN } from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
 import { NextResponse } from "next/server";
 
@@ -5,6 +6,7 @@ import {
   buildBuyOutcomeWithUsdcTransactionEngineSigned,
   type BuyOutcomeSide,
 } from "@/lib/solana/buy-outcome-with-usdc";
+import { pmammBuildBuyWithUsdcTransaction } from "@/lib/engines/pmamm";
 import { parseUsdcHumanToBaseUnits } from "@/lib/solana/mint-market-positions";
 import { getConnection } from "@/lib/solana/connection";
 import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
@@ -58,17 +60,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid userWallet" }, { status: 400 });
     }
 
-    const engine = loadMarketEngineAuthority();
-    if (!engine) {
-      return NextResponse.json(
-        {
-          error:
-            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required to mint outcomes.",
-        },
-        { status: 503 },
-      );
-    }
-
     const sb = getSupabaseAdmin();
     if (!sb) {
       return NextResponse.json(
@@ -80,7 +71,7 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -126,6 +117,42 @@ export async function POST(req: Request) {
       "[predicted][buy-outcome-usdc] api: building transaction",
       JSON.stringify({ slug, user: userWallet, side: sideRaw }),
     );
+
+    if (rec.market_engine === "PM_AMM") {
+      const tx = await pmammBuildBuyWithUsdcTransaction({
+        connection,
+        user,
+        marketPda: new PublicKey(rec.pool_address!),
+        side,
+        usdcAmountAtoms: new BN(usdcAtoms.toString()),
+        minOut: new BN(0),
+      });
+      const serialized = tx.serialize({
+        requireAllSignatures: false,
+        verifySignatures: false,
+      });
+      return NextResponse.json({
+        transaction: Buffer.from(serialized).toString("base64"),
+        log: {
+          engine: "PM_AMM",
+          side,
+          usdcAmountAtoms: usdcAtoms.toString(),
+        },
+        recentBlockhash: tx.recentBlockhash ?? undefined,
+        lastValidBlockHeight: undefined,
+      });
+    }
+
+    const engine = loadMarketEngineAuthority();
+    if (!engine) {
+      return NextResponse.json(
+        {
+          error:
+            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required to mint outcomes.",
+        },
+        { status: 503 },
+      );
+    }
 
     const { serialized, log, recentBlockhash, lastValidBlockHeight } =
       await buildBuyOutcomeWithUsdcTransactionEngineSigned({

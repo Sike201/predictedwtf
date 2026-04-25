@@ -45,7 +45,7 @@ export async function backfillMarketPriceHistoryFromOnchainActivity(params: {
 
   const { data: row, error: mErr } = await sb
     .from("markets")
-    .select("id, slug, status, pool_address, yes_mint, no_mint")
+    .select("id, slug, status, pool_address, yes_mint, no_mint, market_engine, usdc_mint")
     .eq("slug", params.slug.trim())
     .eq("status", "live")
     .maybeSingle();
@@ -59,6 +59,8 @@ export async function backfillMarketPriceHistoryFromOnchainActivity(params: {
     pool_address: string | null;
     yes_mint: string | null;
     no_mint: string | null;
+    market_engine?: string | null;
+    usdc_mint?: string | null;
   };
 
   if (!market.pool_address || !market.yes_mint || !market.no_mint) {
@@ -85,6 +87,16 @@ export async function backfillMarketPriceHistoryFromOnchainActivity(params: {
     limit,
   });
 
+  const engine = market.market_engine === "PM_AMM" ? "PM_AMM" : "GAMM";
+  let collateralPk: PublicKey | undefined;
+  if (engine === "PM_AMM" && market.usdc_mint) {
+    try {
+      collateralPk = new PublicKey(market.usdc_mint);
+    } catch {
+      collateralPk = undefined;
+    }
+  }
+
   let entries;
   try {
     entries = await fetchPoolOnchainActivity(connection, {
@@ -92,6 +104,9 @@ export async function backfillMarketPriceHistoryFromOnchainActivity(params: {
       yesMint,
       noMint,
       limit,
+      ...(engine === "PM_AMM" && collateralPk
+        ? { marketEngine: "PM_AMM" as const, collateralMint: collateralPk }
+        : {}),
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -192,7 +207,7 @@ export async function marketNeedsChartHistoryRepair(params: {
 
   const { data: row, error: mErr } = await sb
     .from("markets")
-    .select("id, pool_address, yes_mint, no_mint")
+    .select("id, pool_address, yes_mint, no_mint, market_engine, usdc_mint")
     .eq("slug", params.slug.trim())
     .eq("status", "live")
     .maybeSingle();
@@ -211,6 +226,8 @@ export async function marketNeedsChartHistoryRepair(params: {
     pool_address: string;
     yes_mint: string;
     no_mint: string;
+    market_engine?: string | null;
+    usdc_mint?: string | null;
   };
 
   const { count: dbRowCount = 0 } = await sb
@@ -223,6 +240,16 @@ export async function marketNeedsChartHistoryRepair(params: {
   const noPk = new PublicKey(market.no_mint);
   const pairPk = new PublicKey(market.pool_address);
 
+  const engine = market.market_engine === "PM_AMM" ? "PM_AMM" : "GAMM";
+  let collateralPk: PublicKey | undefined;
+  if (engine === "PM_AMM" && market.usdc_mint) {
+    try {
+      collateralPk = new PublicKey(market.usdc_mint);
+    } catch {
+      collateralPk = undefined;
+    }
+  }
+
   let entries: Awaited<ReturnType<typeof fetchPoolOnchainActivity>> = [];
   try {
     entries = await fetchPoolOnchainActivity(connection, {
@@ -230,6 +257,9 @@ export async function marketNeedsChartHistoryRepair(params: {
       yesMint: yesPk,
       noMint: noPk,
       limit: 40,
+      ...(engine === "PM_AMM" && collateralPk
+        ? { marketEngine: "PM_AMM" as const, collateralMint: collateralPk }
+        : {}),
     });
   } catch {
     return {

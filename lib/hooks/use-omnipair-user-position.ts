@@ -55,6 +55,18 @@ export function useOmnipairUserPosition(
   }, []);
 
   useEffect(() => {
+    if (market.engine === "PM_AMM") {
+      setSnapshot(null);
+      setError(null);
+      setLoading(false);
+      const waitRefresh = refreshCompletionRef.current;
+      if (waitRefresh?.nonce === nonce) {
+        waitRefresh.resolve();
+        refreshCompletionRef.current = null;
+      }
+      return;
+    }
+
     if (!connected || !publicKey || !market.pool?.poolId) {
       setSnapshot(null);
       setError(null);
@@ -192,7 +204,14 @@ export function useOmnipairUserPosition(
     return () => {
       ac.abort();
     };
-  }, [connected, publicKey, market.id, market.pool?.poolId, nonce]);
+  }, [
+    connected,
+    publicKey,
+    market.id,
+    market.engine,
+    market.pool?.poolId,
+    nonce,
+  ]);
 
   return { snapshot, loading, error, refresh, refreshAsync };
 }

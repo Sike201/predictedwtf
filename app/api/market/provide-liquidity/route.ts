@@ -1,6 +1,8 @@
+import { BN } from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
 import { NextResponse } from "next/server";
 
+import { pmammBuildDepositLiquidityUserTransaction } from "@/lib/engines/pmamm";
 import { buildProvideLiquidityWithUsdcTransactionEngineSigned } from "@/lib/solana/provide-liquidity-usdc";
 import { parseUsdcHumanToBaseUnits } from "@/lib/solana/mint-market-positions";
 import { getConnection } from "@/lib/solana/connection";
@@ -46,17 +48,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid userWallet" }, { status: 400 });
     }
 
-    const engine = loadMarketEngineAuthority();
-    if (!engine) {
-      return NextResponse.json(
-        {
-          error:
-            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required to mint outcomes.",
-        },
-        { status: 503 },
-      );
-    }
-
     const sb = getSupabaseAdmin();
     if (!sb) {
       return NextResponse.json(
@@ -68,7 +59,7 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -113,6 +104,47 @@ export async function POST(req: Request) {
     }
 
     const connection = getConnection();
+    const rec = row as MarketRecord;
+
+    if (rec.market_engine === "PM_AMM") {
+      const tx = await pmammBuildDepositLiquidityUserTransaction({
+        connection,
+        user,
+        marketPda: new PublicKey(rec.pool_address!),
+        amountAtoms: new BN(usdcAtoms.toString()),
+      });
+      const serialized = tx.serialize({
+        requireAllSignatures: false,
+        verifySignatures: false,
+      });
+      console.info(
+        "[predicted][lp-action]",
+        JSON.stringify({
+          slug,
+          action: "deposit_pmamm",
+          usdcAmountAtoms: usdcAtoms.toString(),
+          user: userWallet,
+        }),
+      );
+      return NextResponse.json({
+        transaction: Buffer.from(serialized).toString("base64"),
+        log: { engine: "PM_AMM" },
+        recentBlockhash: tx.recentBlockhash ?? undefined,
+        lastValidBlockHeight: undefined,
+      });
+    }
+
+    const engine = loadMarketEngineAuthority();
+    if (!engine) {
+      return NextResponse.json(
+        {
+          error:
+            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required to mint outcomes.",
+        },
+        { status: 503 },
+      );
+    }
+
     const pairAddress = new PublicKey(row.pool_address);
     const yesMint = new PublicKey(row.yes_mint);
     const noMint = new PublicKey(row.no_mint);

@@ -38,7 +38,7 @@ export async function GET(req: Request) {
 
     const { data, error } = await sb
       .from("markets")
-      .select("id,slug,status,pool_address,yes_mint,no_mint")
+      .select("id,slug,status,pool_address,yes_mint,no_mint,market_engine,usdc_mint")
       .eq("slug", slug)
       .maybeSingle();
 
@@ -52,6 +52,8 @@ export async function GET(req: Request) {
       pool_address: string | null;
       yes_mint: string | null;
       no_mint: string | null;
+      market_engine?: string | null;
+      usdc_mint?: string | null;
     };
 
     if (
@@ -69,12 +71,24 @@ export async function GET(req: Request) {
     const connection = getConnection();
     const yesPk = new PublicKey(row.yes_mint);
     const noPk = new PublicKey(row.no_mint);
+    const engine = row.market_engine === "PM_AMM" ? "PM_AMM" : "GAMM";
+    let collateralPk: PublicKey | undefined;
+    if (engine === "PM_AMM" && row.usdc_mint) {
+      try {
+        collateralPk = new PublicKey(row.usdc_mint);
+      } catch {
+        collateralPk = undefined;
+      }
+    }
 
     const entries = await fetchPoolOnchainActivity(connection, {
       pairAddress: new PublicKey(row.pool_address),
       yesMint: yesPk,
       noMint: noPk,
       limit,
+      ...(engine === "PM_AMM" && collateralPk
+        ? { marketEngine: "PM_AMM" as const, collateralMint: collateralPk }
+        : {}),
     });
 
     if (process.env.NODE_ENV === "development" && entries.length > 0) {

@@ -188,6 +188,14 @@ export function MarketDetailHeader({
             {market.resolution.status === "resolved" && market.resolution.resolvedAt ? (
               <span className="text-zinc-700">·</span>
             ) : null}
+            {market.engine === "PM_AMM" ? (
+              <>
+                <span className="rounded border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-violet-200">
+                  pmAMM
+                </span>
+                <span className="text-zinc-700">·</span>
+              </>
+            ) : null}
             <span>
               By{" "}
               <span className="font-medium text-zinc-300">{creatorHandle}</span>

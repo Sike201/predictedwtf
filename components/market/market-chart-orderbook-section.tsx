@@ -836,6 +836,7 @@ export function MarketChartOrderbookSection({
       ) : (
         <MarketOrderbookPanel
           marketSlug={market.id}
+          marketEngine={market.engine}
           yesMidCents={yesCents}
           noMidCents={noCents}
           midPriceUnavailable={midPriceUnavailable}

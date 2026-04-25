@@ -45,14 +45,37 @@ export async function compareVolumePipelineToOrderbookEntry(params: {
   const { connection, marketId, yesMint, noMint, sample } = params;
   const txSignature = sample.signature;
 
-  const volume = await fetchSingleTxTradeVolumeUsd(connection, {
+  const sb = getSupabaseAdmin();
+
+  let volParams: Parameters<typeof fetchSingleTxTradeVolumeUsd>[1] = {
     signature: txSignature,
     yesMint,
     noMint,
-  });
+  };
+  if (sb) {
+    const { data: meRow } = await sb
+      .from("markets")
+      .select("market_engine, usdc_mint")
+      .eq("id", marketId)
+      .maybeSingle();
+    const eng = (meRow as { market_engine?: string } | null)?.market_engine;
+    const um = (meRow as { usdc_mint?: string | null } | null)?.usdc_mint;
+    if (eng === "PM_AMM" && um) {
+      try {
+        volParams = {
+          ...volParams,
+          marketEngine: "PM_AMM",
+          collateralMint: new PublicKey(um),
+        };
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  const volume = await fetchSingleTxTradeVolumeUsd(connection, volParams);
 
   let dbHasPriceSnapshotRow: boolean | null = null;
-  const sb = getSupabaseAdmin();
   if (sb) {
     const { data } = await sb
       .from("market_price_history")

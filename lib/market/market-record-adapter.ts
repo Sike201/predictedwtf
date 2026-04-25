@@ -6,7 +6,12 @@ import {
 import { pickActiveResolveOrExpiryRaw, parseResolveAfterEpochMs } from "@/lib/market/utc-instant";
 import { pinataGatewayUrl } from "@/lib/storage/pinata";
 import type { MarketRecord } from "@/lib/types/market-record";
-import type { Market, MarketTopic, OutcomeSide } from "@/lib/types/market";
+import type {
+  Market,
+  MarketEngine,
+  MarketTopic,
+  OutcomeSide,
+} from "@/lib/types/market";
 
 const CARD_LAYOUTS: Array<Market["cardLayout"]> = ["a", "b", "c", "d"];
 
@@ -93,10 +98,17 @@ export function marketRecordToMarket(record: MarketRecord, layoutIndex = 0): Mar
   /** Immediate UI baseline from DB; on-chain refresh can refine in header/API without blocking cards. */
   const volumeUsd = coerceUsdVolumeFromDb(record.last_known_volume_usd);
 
+  const engine: MarketEngine =
+    record.market_engine === "PM_AMM" ? "PM_AMM" : "GAMM";
+  const poolPrimary =
+    engine === "PM_AMM"
+      ? (record.pmamm_market_address ?? record.pool_address)
+      : record.pool_address;
+
   const pool =
-    record.pool_address && record.yes_mint && record.no_mint
+    poolPrimary && record.yes_mint && record.no_mint
       ? {
-          poolId: record.pool_address,
+          poolId: poolPrimary,
           yesMint: record.yes_mint,
           noMint: record.no_mint,
           yesPrice: finalYes,
@@ -107,6 +119,10 @@ export function marketRecordToMarket(record: MarketRecord, layoutIndex = 0): Mar
   const m: Market = {
     id: slug,
     marketRowId: record.id,
+    engine,
+    onchainProgramId: record.onchain_program_id ?? undefined,
+    pmammMarketAddress: record.pmamm_market_address ?? undefined,
+    collateralMint: record.usdc_mint ?? undefined,
     question: record.title,
     description: record.description,
     imageUrl,

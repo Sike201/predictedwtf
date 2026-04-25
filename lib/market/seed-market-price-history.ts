@@ -36,7 +36,7 @@ export async function seedMarketPriceHistoryIfEmpty(
   const { data: row, error: mErr } = await sb
     .from("markets")
     .select(
-      "id, slug, status, pool_address, yes_mint, no_mint, seed_liquidity_tx, pool_init_tx, created_tx",
+      "id, slug, status, pool_address, yes_mint, no_mint, market_engine, seed_liquidity_tx, pool_init_tx, created_tx",
     )
     .eq("slug", slug)
     .eq("status", "live")
@@ -52,6 +52,7 @@ export async function seedMarketPriceHistoryIfEmpty(
     pool_address: string | null;
     yes_mint: string | null;
     no_mint: string | null;
+    market_engine?: string | null;
     seed_liquidity_tx: string | null;
     pool_init_tx: string | null;
     created_tx: string | null;
@@ -93,6 +94,8 @@ export async function seedMarketPriceHistoryIfEmpty(
   }
 
   const connection = getConnection();
+  const engineHint =
+    market.market_engine === "PM_AMM" ? "PM_AMM" : "GAMM";
   const candidates = [
     market.seed_liquidity_tx,
     market.pool_init_tx,
@@ -108,6 +111,7 @@ export async function seedMarketPriceHistoryIfEmpty(
       pairAddress,
       yesMint,
       noMint,
+      marketEngineHint: engineHint,
     });
     if (result.ok) {
       logRepair("seed_insert_ok", {
@@ -149,6 +153,7 @@ export async function seedMarketPriceHistoryIfEmpty(
     pairAddress,
     yesMint,
     noMint,
+    marketEngineHint: engineHint,
   });
 
   if (!fallback.ok) {

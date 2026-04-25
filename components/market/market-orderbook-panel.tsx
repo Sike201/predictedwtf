@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   POOL_ACTIVITY_REFRESH_EVENT,
 } from "@/lib/market/recent-market-transactions";
+import type { MarketEngine } from "@/lib/types/market";
 import { devnetTxExplorerUrl, shortenTransactionSignature } from "@/lib/utils/solana-explorer";
 import { cn } from "@/lib/utils/cn";
 
@@ -17,6 +18,8 @@ type PoolActivityEntry = {
 
 type MarketOrderbookPanelProps = {
   marketSlug: string;
+  /** When PM_AMM, size column is USDC notional (6 dp). */
+  marketEngine?: MarketEngine;
   yesMidCents: number;
   noMidCents: number;
   /** When RPC pool read failed but market has a pool address. */
@@ -44,6 +47,7 @@ function formatTimeCell(at: number): string {
 
 export function MarketOrderbookPanel({
   marketSlug,
+  marketEngine,
   yesMidCents,
   noMidCents,
   midPriceUnavailable = false,
@@ -170,7 +174,9 @@ export function MarketOrderbookPanel({
       <div className="border-b border-white/[0.06]">
         <div className="grid grid-cols-[minmax(0,0.85fr)_minmax(0,0.75fr)_64px] gap-1 border-b border-white/[0.05] px-0 py-1.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
           <span>Trade</span>
-          <span>Size</span>
+          <span title={marketEngine === "PM_AMM" ? "USDC notional" : undefined}>
+            {marketEngine === "PM_AMM" ? "Size (USDC)" : "Size"}
+          </span>
           <span className="text-right">Tx</span>
         </div>
         {loading ? (

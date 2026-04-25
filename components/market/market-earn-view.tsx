@@ -152,6 +152,33 @@ export function MarketEarnView({ market }: MarketEarnViewProps) {
     }
     setLpLoading(true);
     try {
+      if (market.engine === "PM_AMM") {
+        const qs = new URLSearchParams({
+          slug: market.id,
+          userWallet: publicKey.toBase58(),
+        });
+        const res = await fetch(`/api/market/pmamm-lp-position?${qs.toString()}`);
+        const j = (await res.json()) as {
+          error?: string;
+          userShares?: string;
+          totalLpShares?: string;
+        };
+        if (!res.ok || j.error) {
+          setLpAtoms(null);
+          setTotalLp(null);
+          return;
+        }
+        setPairFee({ swapFeeBps: 0, futarchyShareBps: 0 });
+        setLpDecimals(0);
+        try {
+          setTotalLp(BigInt(j.totalLpShares ?? "0"));
+          setLpAtoms(BigInt(j.userShares ?? "0"));
+        } catch {
+          setTotalLp(0n);
+          setLpAtoms(0n);
+        }
+        return;
+      }
       const programId = requireOmnipairProgramId();
       const pair = new PublicKey(market.pool.poolId);
       const info = await connection.getAccountInfo(pair, "confirmed");
@@ -204,7 +231,7 @@ export function MarketEarnView({ market }: MarketEarnViewProps) {
     } finally {
       setLpLoading(false);
     }
-  }, [hasPool, market.pool, publicKey, connection]);
+  }, [hasPool, market.pool, market.engine, market.id, publicKey, connection]);
 
   useEffect(() => {
     void refreshVolumes();
@@ -241,6 +268,14 @@ export function MarketEarnView({ market }: MarketEarnViewProps) {
           </Link>
         </div>
 
+        {livePool.enginePoolMessage ? (
+          <div
+            className="mb-4 rounded-lg border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-[13px] text-rose-100/95"
+            role="status"
+          >
+            {livePool.enginePoolMessage}
+          </div>
+        ) : null}
         {livePool.rpcDegradedMessage ? (
           <div
             className="mb-4 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[13px] text-amber-100/95"

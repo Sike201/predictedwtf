@@ -5,6 +5,7 @@ import { getConnection } from "@/lib/solana/connection";
 import { parseUsdcHumanToBaseUnits } from "@/lib/solana/mint-market-positions";
 import {
   estimateBuyOutcomeFinalExposure,
+  estimateBuyOutcomeFinalExposurePmamm,
   type BuyOutcomeSide,
 } from "@/lib/solana/buy-outcome-with-usdc";
 import {
@@ -55,7 +56,7 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -80,14 +81,23 @@ export async function POST(req: Request) {
       );
     }
 
-    const est = await estimateBuyOutcomeFinalExposure({
-      connection: getConnection(),
-      side,
-      yesMint: new PublicKey(row.yes_mint),
-      noMint: new PublicKey(row.no_mint),
-      pairAddress: new PublicKey(row.pool_address),
-      usdcAmountAtoms: usdcAtoms,
-    });
+    const connection = getConnection();
+    const est =
+      (row as { market_engine?: string }).market_engine === "PM_AMM"
+        ? await estimateBuyOutcomeFinalExposurePmamm({
+            connection,
+            side,
+            marketPda: new PublicKey(row.pool_address),
+            usdcAmountAtoms: usdcAtoms,
+          })
+        : await estimateBuyOutcomeFinalExposure({
+            connection,
+            side,
+            yesMint: new PublicKey(row.yes_mint),
+            noMint: new PublicKey(row.no_mint),
+            pairAddress: new PublicKey(row.pool_address),
+            usdcAmountAtoms: usdcAtoms,
+          });
     return NextResponse.json({ estimate: est });
   } catch (e: unknown) {
     return NextResponse.json(

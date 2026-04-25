@@ -24,6 +24,7 @@ import {
   Transaction,
 } from "@solana/web3.js";
 
+import { deriveMarketProbabilityFromPoolState } from "@/lib/market/derive-market-probability";
 import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
 import {
   decodeFutarchySwapShareBps,
@@ -42,6 +43,7 @@ import { buildOmnipairSwapInstruction } from "@/lib/solana/omnipair-swap-instruc
 import { DEFAULT_OMNIPAIR_POOL_PARAMS } from "@/lib/solana/omnipair-params-hash";
 import { deriveOmnipairLayout, getGlobalFutarchyAuthorityPDA } from "@/lib/solana/omnipair-pda";
 import { requireOmnipairProgramId } from "@/lib/solana/omnipair-program";
+import { readPmammMarketPoolSnapshot } from "@/lib/solana/pmamm-program";
 
 export type BuyOutcomeSide = "yes" | "no";
 
@@ -285,5 +287,50 @@ export async function estimateBuyOutcomeFinalExposure(params: {
     estimatedSwapAmountOut: estimatedSwapAmountOut.toString(),
     minSwapAmountOut: minSwapAmountOut.toString(),
     estimatedFinalChosenSideAtoms: estimatedFinalChosenSideAtoms.toString(),
+  };
+}
+
+/**
+ * PM_AMM buy preview: spot-implied probability from on-chain reserves (same mid as the chart).
+ * Coarser than the program’s exact swap; avoids Omnipair-only account layout.
+ */
+export async function estimateBuyOutcomeFinalExposurePmamm(params: {
+  connection: Connection;
+  side: BuyOutcomeSide;
+  marketPda: PublicKey;
+  usdcAmountAtoms: bigint;
+  slippageBps?: number;
+}): Promise<BuyOutcomeExposureEstimate> {
+  const slippageBps = params.slippageBps ?? 100;
+  const pm = await readPmammMarketPoolSnapshot(
+    params.connection,
+    params.marketPda,
+  );
+  const spot = deriveMarketProbabilityFromPoolState({
+    reserveYes: pm.reserveYes,
+    reserveNo: pm.reserveNo,
+  });
+  if (!spot) {
+    throw new Error("PM_AMM market state unavailable.");
+  }
+  const p =
+    params.side === "yes" ? spot.yesProbability : spot.noProbability;
+  if (!(p > 0) || !Number.isFinite(p)) {
+    throw new Error("PM_AMM market state unavailable.");
+  }
+  const estFloat = Number(params.usdcAmountAtoms) / p;
+  if (!Number.isFinite(estFloat) || estFloat <= 0) {
+    throw new Error("Estimate rounded to zero.");
+  }
+  let estimatedFinal = BigInt(Math.floor(estFloat));
+  if (estimatedFinal <= 0n) estimatedFinal = 1n;
+  const minOut = applySlippageFloor(estimatedFinal, slippageBps);
+  return {
+    side: params.side,
+    usdcAmountAtoms: params.usdcAmountAtoms.toString(),
+    outcomeMintAtoms: "0",
+    estimatedSwapAmountOut: estimatedFinal.toString(),
+    minSwapAmountOut: minOut.toString(),
+    estimatedFinalChosenSideAtoms: estimatedFinal.toString(),
   };
 }

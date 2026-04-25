@@ -94,7 +94,7 @@ export async function GET(req: Request) {
   const { data: row, error: mErr } = await sb
     .from("markets")
     .select(
-      "id, slug, status, pool_address, yes_mint, no_mint, last_known_volume_usd, last_stats_updated_at",
+      "id, slug, status, pool_address, yes_mint, no_mint, market_engine, usdc_mint, last_known_volume_usd, last_stats_updated_at",
     )
     .eq("slug", slug)
     .maybeSingle();
@@ -117,6 +117,8 @@ export async function GET(req: Request) {
     pool_address: string | null;
     yes_mint: string | null;
     no_mint: string | null;
+    market_engine?: string | null;
+    usdc_mint?: string | null;
     last_known_volume_usd: unknown;
     last_stats_updated_at: string | null;
   };
@@ -179,6 +181,16 @@ export async function GET(req: Request) {
   const noPk = new PublicKey(market.no_mint);
   const pairPk = new PublicKey(market.pool_address);
 
+  const engine = market.market_engine === "PM_AMM" ? "PM_AMM" : "GAMM";
+  let collateralPk: PublicKey | undefined;
+  if (engine === "PM_AMM" && market.usdc_mint) {
+    try {
+      collateralPk = new PublicKey(market.usdc_mint);
+    } catch {
+      collateralPk = undefined;
+    }
+  }
+
   let entries: Awaited<ReturnType<typeof fetchPoolOnchainActivity>> = [];
   try {
     entries = await fetchPoolOnchainActivity(connection, {
@@ -186,6 +198,9 @@ export async function GET(req: Request) {
       yesMint: yesPk,
       noMint: noPk,
       limit: 40,
+      ...(engine === "PM_AMM" && collateralPk
+        ? { marketEngine: "PM_AMM" as const, collateralMint: collateralPk }
+        : {}),
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

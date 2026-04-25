@@ -37,7 +37,7 @@ export async function GET(req: Request) {
 
     const { data, error } = await sb
       .from("markets")
-      .select("pool_address,yes_mint,no_mint")
+      .select("pool_address,yes_mint,no_mint,market_engine")
       .eq("slug", slug)
       .maybeSingle();
 
@@ -49,7 +49,16 @@ export async function GET(req: Request) {
       pool_address: string | null;
       yes_mint: string | null;
       no_mint: string | null;
+      market_engine?: string | null;
     };
+
+    if (row.market_engine === "PM_AMM") {
+      return NextResponse.json({
+        snapshot: null,
+        userPositionPda: null,
+        note: "PM_AMM markets do not use Omnipair lending positions.",
+      });
+    }
 
     if (!row.pool_address || !row.yes_mint || !row.no_mint) {
       return NextResponse.json(

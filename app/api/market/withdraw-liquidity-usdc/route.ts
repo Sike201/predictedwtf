@@ -1,13 +1,11 @@
+import { BN } from "@coral-xyz/anchor";
 import { PublicKey } from "@solana/web3.js";
 import { getMint } from "@solana/spl-token";
 import { NextResponse } from "next/server";
 
-import {
-  isMarketRecordResolved,
-  isMarketRowBlockedForNewBuys,
-  MARKET_RESOLVED_TRADING_ERROR,
-  MARKET_RESOLVING_TRADING_ERROR,
-} from "@/lib/market/market-trading-blocked";
+import { pmammBuildWithdrawLiquidityTransaction } from "@/lib/engines/pmamm";
+import { readPmammLpSnapshot } from "@/lib/solana/pmamm-read-lp";
+
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import type { MarketRecord } from "@/lib/types/market-record";
 import { getConnection } from "@/lib/solana/connection";
@@ -90,7 +88,7 @@ export async function GET(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -99,25 +97,20 @@ export async function GET(req: Request) {
       return NextResponse.json({ error: "Market not found" }, { status: 404 });
     }
 
-    if (isMarketRowBlockedForNewBuys(row as MarketRecord)) {
-      return NextResponse.json(
-        {
-          error: isMarketRecordResolved(row)
-            ? MARKET_RESOLVED_TRADING_ERROR
-            : MARKET_RESOLVING_TRADING_ERROR,
-        },
-        { status: 400 },
-      );
-    }
-
     if (
-      row.status !== "live" ||
+      row.status === "creating" ||
+      row.status === "failed" ||
       !row.yes_mint ||
       !row.no_mint ||
       !row.pool_address
     ) {
       return NextResponse.json(
-        { error: "Market must be live with outcome mints and pool" },
+        {
+          error:
+            row.status === "creating" || row.status === "failed"
+              ? "Market is not available for withdrawals yet."
+              : "Market is missing pool or outcome mints on record.",
+        },
         { status: 400 },
       );
     }
@@ -126,6 +119,42 @@ export async function GET(req: Request) {
     const pairAddress = new PublicKey(row.pool_address);
     const yesMint = new PublicKey(row.yes_mint);
     const noMint = new PublicKey(row.no_mint);
+
+    if ((row as MarketRecord).market_engine === "PM_AMM") {
+      const liquidityIn = parseLiquidityIn({
+        liquidityHuman,
+        liquidityAtomsStr: liquidityAtoms || undefined,
+        lpDecimals: 0,
+      });
+      if (liquidityIn <= 0n) {
+        return NextResponse.json(
+          { error: "Enter an LP share amount greater than zero" },
+          { status: 400 },
+        );
+      }
+      if (liquidityIn > MAX_LP_ATOMS) {
+        return NextResponse.json({ error: "Amount exceeds cap" }, { status: 400 });
+      }
+      const snap = await readPmammLpSnapshot({
+        connection,
+        marketPda: pairAddress,
+        owner: user,
+      });
+      if (liquidityIn > (snap?.userShares ?? 0n)) {
+        return NextResponse.json(
+          { error: "Amount exceeds your LP shares. Refresh and try Max." },
+          { status: 400 },
+        );
+      }
+      return NextResponse.json({
+        plan: {
+          usdcOutAtoms: "0",
+          leftoverYesAtoms: "0",
+          leftoverNoAtoms: "0",
+        },
+        removeLog: { engine: "PM_AMM" },
+      });
+    }
 
     const poolState = await readOmnipairPoolState(connection, {
       pairAddress,
@@ -210,17 +239,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid userWallet" }, { status: 400 });
     }
 
-    const engine = loadMarketEngineAuthority();
-    if (!engine) {
-      return NextResponse.json(
-        {
-          error:
-            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required to redeem to USDC.",
-        },
-        { status: 503 },
-      );
-    }
-
     const sb = getSupabaseAdmin();
     if (!sb) {
       return NextResponse.json(
@@ -232,7 +250,7 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -241,25 +259,20 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Market not found" }, { status: 404 });
     }
 
-    if (isMarketRowBlockedForNewBuys(row as MarketRecord)) {
-      return NextResponse.json(
-        {
-          error: isMarketRecordResolved(row)
-            ? MARKET_RESOLVED_TRADING_ERROR
-            : MARKET_RESOLVING_TRADING_ERROR,
-        },
-        { status: 400 },
-      );
-    }
-
     if (
-      row.status !== "live" ||
+      row.status === "creating" ||
+      row.status === "failed" ||
       !row.yes_mint ||
       !row.no_mint ||
       !row.pool_address
     ) {
       return NextResponse.json(
-        { error: "Market must be live with outcome mints and pool" },
+        {
+          error:
+            row.status === "creating" || row.status === "failed"
+              ? "Market is not available for withdrawals yet."
+              : "Market is missing pool or outcome mints on record.",
+        },
         { status: 400 },
       );
     }
@@ -268,6 +281,77 @@ export async function POST(req: Request) {
     const pairAddress = new PublicKey(row.pool_address);
     const yesMint = new PublicKey(row.yes_mint);
     const noMint = new PublicKey(row.no_mint);
+
+    if ((row as MarketRecord).market_engine === "PM_AMM") {
+      const liquidityIn = parseLiquidityIn({
+        liquidityHuman,
+        liquidityAtomsStr: liquidityAtoms || undefined,
+        lpDecimals: 0,
+      });
+      if (liquidityIn <= 0n) {
+        return NextResponse.json(
+          { error: "Enter an LP share amount greater than zero" },
+          { status: 400 },
+        );
+      }
+      if (liquidityIn > MAX_LP_ATOMS) {
+        return NextResponse.json({ error: "Amount exceeds cap" }, { status: 400 });
+      }
+      const snap = await readPmammLpSnapshot({
+        connection,
+        marketPda: pairAddress,
+        owner: user,
+      });
+      if (liquidityIn > (snap?.userShares ?? 0n)) {
+        return NextResponse.json(
+          { error: "Amount exceeds your LP shares. Refresh and try Max." },
+          { status: 400 },
+        );
+      }
+      const tx = await pmammBuildWithdrawLiquidityTransaction({
+        connection,
+        user,
+        marketPda: pairAddress,
+        sharesToBurn: new BN(liquidityIn.toString()),
+      });
+      const serialized = tx.serialize({
+        requireAllSignatures: false,
+        verifySignatures: false,
+      });
+      console.info(
+        "[predicted][lp-action]",
+        JSON.stringify({
+          slug,
+          action: "withdraw_pmamm",
+          user: userWallet,
+          sharesBurned: liquidityIn.toString(),
+        }),
+      );
+      return NextResponse.json({
+        transaction: Buffer.from(serialized).toString("base64"),
+        log: {
+          engine: "PM_AMM",
+          redeem: {
+            usdcOutAtoms: "0",
+            leftoverYesAtoms: "0",
+            leftoverNoAtoms: "0",
+          },
+        },
+        recentBlockhash: tx.recentBlockhash ?? undefined,
+        lastValidBlockHeight: undefined,
+      });
+    }
+
+    const engine = loadMarketEngineAuthority();
+    if (!engine) {
+      return NextResponse.json(
+        {
+          error:
+            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required to redeem to USDC.",
+        },
+        { status: 503 },
+      );
+    }
 
     const poolState = await readOmnipairPoolState(connection, {
       pairAddress,

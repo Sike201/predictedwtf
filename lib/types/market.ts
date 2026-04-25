@@ -1,7 +1,9 @@
 /**
- * Core domain types for Solana prediction markets (Omnipair GAMM).
+ * Core domain types for Solana prediction markets (Omnipair GAMM + pm-AMM).
  * UI + future Anchor program alignment.
  */
+
+export type MarketEngine = "GAMM" | "PM_AMM";
 
 /** Primary topic tag on a market (used for category filters). */
 export type MarketTopic =
@@ -85,6 +87,14 @@ export interface Market {
   id: string;
   /** Supabase `markets.id` (UUID) when loaded from DB — for server-side cache updates. */
   marketRowId?: string;
+  /** Trading / LP implementation (default GAMM for legacy rows). */
+  engine?: MarketEngine;
+  /** Program id for this market’s engine (when set in DB). */
+  onchainProgramId?: string;
+  /** pm-AMM market PDA (when `engine === "PM_AMM"`). */
+  pmammMarketAddress?: string;
+  /** Collateral mint (pm-AMM USDC). */
+  collateralMint?: string;
   question: string;
   description: string;
   imageUrl: string;

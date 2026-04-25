@@ -30,10 +30,21 @@ function normalizePoints(
     const t = coerceHistoryTimeMs(tRaw);
     const p = typeof x.p === "number" ? x.p : Number(x.p);
     if (!Number.isFinite(t) || !Number.isFinite(p)) continue;
-    out.push({ t, p });
+    /** Chart expects 0–1 probability; clamp stray 0–100 rows. */
+    const pUnit = p > 1.0001 ? Math.min(1, Math.max(0, p / 100)) : Math.min(1, Math.max(0, p));
+    out.push({ t, p: pUnit });
   }
   out.sort((a, b) => a.t - b.t);
-  return out;
+  const dedup: Point[] = [];
+  for (const pt of out) {
+    const prev = dedup[dedup.length - 1];
+    if (prev && prev.t === pt.t) {
+      dedup[dedup.length - 1] = pt;
+    } else {
+      dedup.push(pt);
+    }
+  }
+  return dedup;
 }
 
 function mergeByT(a: Point[], b: Point[]): Point[] {

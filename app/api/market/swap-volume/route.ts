@@ -6,6 +6,10 @@ import {
   fetchPoolSwapVolumeUsd24hWithStats,
   fetchPoolTotalSwapVolumeUsdWithStats,
 } from "@/lib/solana/fetch-pool-onchain-activity";
+import {
+  fetchPmammMarketSwapVolumeUsd24hWithStats,
+  fetchPmammMarketTotalSwapVolumeUsdWithStats,
+} from "@/lib/solana/pmamm-pool-activity";
 
 export const maxDuration = 60;
 
@@ -16,6 +20,9 @@ export async function GET(request: NextRequest) {
   const poolId = request.nextUrl.searchParams.get("poolId");
   const yesMint = request.nextUrl.searchParams.get("yesMint");
   const noMint = request.nextUrl.searchParams.get("noMint");
+  const engine = request.nextUrl.searchParams.get("engine")?.trim();
+  const collateralMintParam =
+    request.nextUrl.searchParams.get("collateralMint")?.trim();
   const windowParam = request.nextUrl.searchParams.get("window");
   const use24h =
     windowParam === "24h" ||
@@ -28,19 +35,45 @@ export async function GET(request: NextRequest) {
     );
   }
 
+  if (engine === "PM_AMM" && !collateralMintParam) {
+    return NextResponse.json(
+      { volumeUsd: 0, signaturesScanned: 0, swapsParsed: 0 },
+      { status: 400 },
+    );
+  }
+
   try {
     const connection = getConnection();
-    const { volumeUsd, signaturesScanned, swapsParsed } = use24h
-      ? await fetchPoolSwapVolumeUsd24hWithStats(connection, {
-          pairAddress: new PublicKey(poolId),
-          yesMint: new PublicKey(yesMint),
-          noMint: new PublicKey(noMint),
-        })
-      : await fetchPoolTotalSwapVolumeUsdWithStats(connection, {
-          pairAddress: new PublicKey(poolId),
-          yesMint: new PublicKey(yesMint),
-          noMint: new PublicKey(noMint),
-        });
+    const yesPk = new PublicKey(yesMint);
+    const noPk = new PublicKey(noMint);
+    const marketPda = new PublicKey(poolId);
+
+    const { volumeUsd, signaturesScanned, swapsParsed } =
+      engine === "PM_AMM" && collateralMintParam
+        ? use24h
+          ? await fetchPmammMarketSwapVolumeUsd24hWithStats(connection, {
+              marketPda,
+              collateralMint: new PublicKey(collateralMintParam),
+              yesMint: yesPk,
+              noMint: noPk,
+            })
+          : await fetchPmammMarketTotalSwapVolumeUsdWithStats(connection, {
+              marketPda,
+              collateralMint: new PublicKey(collateralMintParam),
+              yesMint: yesPk,
+              noMint: noPk,
+            })
+        : use24h
+          ? await fetchPoolSwapVolumeUsd24hWithStats(connection, {
+              pairAddress: marketPda,
+              yesMint: yesPk,
+              noMint: noPk,
+            })
+          : await fetchPoolTotalSwapVolumeUsdWithStats(connection, {
+              pairAddress: marketPda,
+              yesMint: yesPk,
+              noMint: noPk,
+            });
     if (process.env.NODE_ENV === "development") {
       console.info("[predicted][onchain-volume-direct]", {
         component: "api_market_swap_volume",

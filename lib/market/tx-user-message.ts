@@ -12,6 +12,24 @@ const SPL_WITHDRAW_SHORT =
 const WITHDRAW_USDC_TOKEN_MISMATCH =
   "USDC withdraw failed because the estimated token amounts changed. Try withdrawing as YES + NO or refresh and try again.";
 
+const RESOLVED_NEED_SETTLE_BEFORE_WITHDRAW =
+  "Market is resolved. Please settle/redeem before withdrawing.";
+
+function isWithdrawBlockedPendingSettlementMessage(fullText: string): boolean {
+  const lower = fullText.toLowerCase();
+  return (
+    lower.includes("settlement required") ||
+    lower.includes("must settle") ||
+    lower.includes("please settle") ||
+    lower.includes("needs to be settled") ||
+    lower.includes("not settled") ||
+    lower.includes("unsettled liquidity") ||
+    lower.includes("redeem first") ||
+    lower.includes("must redeem") ||
+    lower.includes("pending settlement")
+  );
+}
+
 function isAlreadyProcessedErrorMessage(message: string): boolean {
   const m = message.toLowerCase();
   return (
@@ -35,11 +53,14 @@ function collectErrorText(error: unknown): string {
 }
 
 /**
- * SPL Token / Tokenkeg "insufficient funds" (burn/transfer) — not native SOL fee payer.
+ * SPL Token program (Tokenkeg) transfer/burn "insufficient funds" — not native SOL fee payer.
+ * Do not treat bare "Tokenkeg" mentions as this; pair with insufficient-funds / token error codes.
  */
 export function isSplTokenInsufficientFundsMessage(fullText: string): boolean {
   const lower = fullText.toLowerCase();
-  if (lower.includes("tokenkeg")) return true;
+  if (lower.includes("tokenkeg") && lower.includes("insufficient funds")) {
+    return true;
+  }
   if (lower.includes("program log: error: insufficient funds")) return true;
   if (
     lower.includes("custom program error: 0x1") ||
@@ -53,7 +74,7 @@ export function isSplTokenInsufficientFundsMessage(fullText: string): boolean {
 /**
  * Native SOL / fee-payer balance (lamports), not SPL token balance.
  */
-function isNativeSolInsufficientMessage(fullText: string): boolean {
+export function isNativeSolInsufficientMessage(fullText: string): boolean {
   const lower = fullText.toLowerCase();
   if (lower.includes("insufficient lamports")) return true;
   if (lower.includes("insufficient funds for fee")) return true;
@@ -118,6 +139,15 @@ export function logAndFormatUserTxError(
 
   if (isComputeBudgetExhaustedMessage(lower)) {
     return SOL_FEE_USER_MESSAGE;
+  }
+
+  if (
+    (context === "withdraw-usdc" ||
+      context === "withdraw-pool" ||
+      context === "withdraw") &&
+    isWithdrawBlockedPendingSettlementMessage(raw)
+  ) {
+    return RESOLVED_NEED_SETTLE_BEFORE_WITHDRAW;
   }
 
   return GENERIC_USER_MESSAGE;

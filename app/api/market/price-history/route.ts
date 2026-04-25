@@ -97,7 +97,7 @@ export async function POST(req: Request) {
 
   const { data: row, error } = await sb
     .from("markets")
-    .select("id, pool_address, yes_mint, no_mint")
+    .select("id, pool_address, yes_mint, no_mint, market_engine")
     .eq("slug", slug)
     .eq("status", "live")
     .maybeSingle();
@@ -145,6 +145,11 @@ export async function POST(req: Request) {
     });
   }
 
+  const marketEngine =
+    (row as { market_engine?: string }).market_engine === "PM_AMM"
+      ? "PM_AMM"
+      : "GAMM";
+
   const result = await recordMarketPriceSnapshotFromChain({
     marketId: row.id,
     txSignature,
@@ -152,6 +157,7 @@ export async function POST(req: Request) {
     pairAddress,
     yesMint,
     noMint,
+    marketEngineHint: marketEngine,
   });
 
   if (!result.ok) {

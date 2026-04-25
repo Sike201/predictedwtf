@@ -741,9 +741,11 @@ export async function fetchSingleTxTradeVolumeUsd(
     signature: string;
     yesMint: PublicKey;
     noMint: PublicKey;
+    /** pm-AMM: use USDC in/out (6 dp) instead of Omnipair outcome parity. */
+    marketEngine?: string;
+    collateralMint?: PublicKey;
   },
 ): Promise<SingleTxTradeVolumeResult> {
-  const omnipairId = getOmnipairProgramId();
   let tx = await connection.getParsedTransaction(params.signature, {
     commitment: "confirmed",
     maxSupportedTransactionVersion: 0,
@@ -771,6 +773,34 @@ export async function fetchSingleTxTradeVolumeUsd(
     };
   }
 
+  if (params.marketEngine === "PM_AMM" && params.collateralMint) {
+    const { parsePmammTradeVolumeUsdMicrosFromParsedTx } = await import(
+      "@/lib/solana/pmamm-pool-activity"
+    );
+    const { requirePmammProgramId } = await import("@/lib/solana/pmamm-config");
+    const parsed = parsePmammTradeVolumeUsdMicrosFromParsedTx(tx, {
+      pmammProgramId: requirePmammProgramId(),
+      collateralMint: params.collateralMint,
+      yesMint: params.yesMint,
+      noMint: params.noMint,
+    });
+    const volumeUsd = Number(parsed.micros) / 1_000_000;
+    const v = Number.isFinite(volumeUsd) ? volumeUsd : 0;
+    console.info("[predicted][sell-volume-trace]", {
+      step: "single_tx_volume_parsed",
+      txSignature: params.signature,
+      source: parsed.source,
+      volumeUsd: v,
+    });
+    return {
+      volumeUsd: v,
+      source: parsed.source,
+      txMissing: false,
+      metaErr: false,
+    };
+  }
+
+  const omnipairId = getOmnipairProgramId();
   const parsed = parseTradeVolumeUsdMicrosFromTx(
     tx,
     omnipairId,
@@ -877,8 +907,24 @@ export async function fetchPoolOnchainActivity(
     yesMint: PublicKey;
     noMint: PublicKey;
     limit?: number;
+    /** When `PM_AMM`, pass with `collateralMint` (USDC) for correct notionals. */
+    marketEngine?: string;
+    collateralMint?: PublicKey;
   },
 ): Promise<OnchainPoolActivityEntry[]> {
+  if (params.marketEngine === "PM_AMM" && params.collateralMint) {
+    const { fetchPmammMarketOnchainActivity } = await import(
+      "@/lib/solana/pmamm-pool-activity"
+    );
+    return fetchPmammMarketOnchainActivity(connection, {
+      marketPda: params.pairAddress,
+      collateralMint: params.collateralMint,
+      yesMint: params.yesMint,
+      noMint: params.noMint,
+      limit: params.limit,
+    });
+  }
+
   /** Must match deployed program for ix decode; falls back without env. */
   const omnipairId = getOmnipairProgramId();
   const cap = Math.min(Math.max(1, params.limit ?? 24), 100);

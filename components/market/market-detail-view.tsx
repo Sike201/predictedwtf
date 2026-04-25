@@ -382,6 +382,7 @@ export function MarketDetailView({
               );
             }
             await priceHistory.recordAfterTrade(detail.signature);
+            void livePool.refresh("after_price_history_post");
           } else {
             if (process.env.NODE_ENV === "development") {
               console.warn(
@@ -404,8 +405,11 @@ export function MarketDetailView({
   );
 
   const onTradePriceSnapshot = useCallback(
-    (sig: string) => priceHistory.recordAfterTrade(sig),
-    [priceHistory],
+    async (sig: string) => {
+      await priceHistory.recordAfterTrade(sig);
+      void livePool.refresh("after_price_history_post");
+    },
+    [priceHistory, livePool.refresh],
   );
 
   return (
@@ -416,6 +420,14 @@ export function MarketDetailView({
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.48, ease: [0.16, 1, 0.3, 1] }}
         >
+          {livePool.enginePoolMessage ? (
+            <div
+              className="mb-3 rounded-lg border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-[13px] text-rose-100/95"
+              role="status"
+            >
+              {livePool.enginePoolMessage}
+            </div>
+          ) : null}
           {livePool.rpcDegradedMessage ? (
             <div
               className="mb-3 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[13px] text-amber-100/95"
@@ -488,6 +500,7 @@ export function MarketDetailView({
                           );
                         }
                         await priceHistory.recordAfterTrade(d.signature);
+                        void livePool.refresh("after_price_history_post");
                       } else {
                         if (process.env.NODE_ENV === "development") {
                           console.warn(

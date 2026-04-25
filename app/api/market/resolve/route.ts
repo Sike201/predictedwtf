@@ -1,3 +1,4 @@
+import { PublicKey } from "@solana/web3.js";
 import { NextResponse } from "next/server";
 
 import { buildMarketResolveMessageV1 } from "@/lib/market/resolve-message";
@@ -5,6 +6,9 @@ import { TRUSTED_RESOLVER_ADDRESS } from "@/lib/market/trusted-resolver";
 import { verifyTrustedResolverMessageSignature } from "@/lib/market/verify-resolver-signature";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import type { OutcomeSide } from "@/lib/types/market";
+import { pmammBuildResolveMarketTransaction } from "@/lib/engines/pmamm";
+import { getConnection } from "@/lib/solana/connection";
+import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
 
 export const runtime = "nodejs";
 
@@ -80,7 +84,7 @@ export async function POST(req: Request) {
   const { data: row, error: qErr } = await sb
     .from("markets")
     .select(
-      "id,slug,status,resolution_status,resolve_after,expiry_ts,resolver_wallet",
+      "id,slug,status,resolution_status,resolve_after,expiry_ts,resolver_wallet,market_engine,pool_address",
     )
     .eq("slug", slug)
     .maybeSingle();
@@ -121,6 +125,55 @@ export async function POST(req: Request) {
   const resolveAfterMs = new Date(afterIso ?? expiryIso ?? "").getTime();
   const earlyResolveUsed =
     Number.isFinite(resolveAfterMs) && Date.now() < resolveAfterMs;
+
+  const recRow = row as {
+    id: string;
+    market_engine?: string | null;
+    pool_address?: string | null;
+  };
+  if (recRow.market_engine === "PM_AMM") {
+    const treasury = loadMarketEngineAuthority();
+    if (!treasury) {
+      return NextResponse.json(
+        {
+          error:
+            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required for pmAMM resolve_market.",
+        },
+        { status: 503 },
+      );
+    }
+    const pool = recRow.pool_address?.trim();
+    if (!pool) {
+      return NextResponse.json(
+        { error: "pmAMM market missing on-chain address" },
+        { status: 400 },
+      );
+    }
+    const connection = getConnection();
+    try {
+      const tx = await pmammBuildResolveMarketTransaction({
+        connection,
+        authority: treasury.publicKey,
+        marketPda: new PublicKey(pool),
+        winningSide: winningOutcome,
+      });
+      tx.partialSign(treasury);
+      const sig = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: false,
+      });
+      await connection.confirmTransaction(sig, "confirmed");
+      console.info(LOG, "pmamm_resolve_market_ok", { slug, signature: sig });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(LOG, "pmamm_resolve_market_failed", { slug, msg, e });
+      return NextResponse.json(
+        {
+          error: `pmAMM on-chain resolve failed: ${msg}`,
+        },
+        { status: 502 },
+      );
+    }
+  }
 
   const resolvedAt = new Date().toISOString();
 

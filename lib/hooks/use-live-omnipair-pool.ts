@@ -18,6 +18,7 @@ import type { Market } from "@/lib/types/market";
 import { isRetriableSolanaRpcError } from "@/lib/solana/connection-resilient";
 import type { OmnipairPoolChainState } from "@/lib/solana/read-omnipair-pool-state";
 import { readOmnipairPoolState } from "@/lib/solana/read-omnipair-pool-state";
+import { readPmammMarketPoolSnapshot } from "@/lib/solana/pmamm-program";
 
 export type LiveOmnipairPoolState = {
   yesProbability: number | null;
@@ -38,11 +39,22 @@ export type LiveOmnipairPoolState = {
   refreshEpoch: number;
   /** Soft warning (e.g. RPC rate limit) while keeping last good prices when possible. */
   rpcDegradedMessage: string | null;
+  /**
+   * PM_AMM-only: user-facing hint when the market account cannot be read (never an Omnipair error).
+   */
+  enginePoolMessage: string | null;
 };
+
+const PMAMM_USER_STATE_MSG =
+  "PM_AMM market state unavailable. Refresh and try again.";
 
 export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
   const { connection } = useConnection();
-  const poolId = market.pool?.poolId ?? null;
+  const engine = market.engine ?? "GAMM";
+  const poolId =
+    engine === "PM_AMM"
+      ? (market.pmammMarketAddress ?? market.pool?.poolId ?? null)
+      : (market.pool?.poolId ?? null);
   const yesMintId = market.pool?.yesMint ?? null;
   const noMintId = market.pool?.noMint ?? null;
   const marketId = market.id;
@@ -62,6 +74,9 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
     useState<DerivedMarketProbability | null>(null);
   const [refreshEpoch, setRefreshEpoch] = useState(0);
   const [rpcDegradedMessage, setRpcDegradedMessage] = useState<string | null>(
+    null,
+  );
+  const [enginePoolMessage, setEnginePoolMessage] = useState<string | null>(
     null,
   );
   const mounted = useRef(true);
@@ -95,6 +110,7 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
         }
         if (mounted.current) {
           setRpcDegradedMessage(null);
+          setEnginePoolMessage(null);
           setUnavailable(false);
           setOneSidedLiquidity(false);
           setYes(resolvedPx.yes);
@@ -132,6 +148,9 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
         }
         if (mounted.current) {
           setRpcDegradedMessage(null);
+          setEnginePoolMessage(
+            engine === "PM_AMM" ? PMAMM_USER_STATE_MSG : null,
+          );
           setLoading(false);
           setUnavailable(true);
           setOneSidedLiquidity(false);
@@ -145,6 +164,68 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
 
       setLoading(true);
       try {
+        if (engine === "PM_AMM") {
+          setEnginePoolMessage(null);
+          const pm = await readPmammMarketPoolSnapshot(
+            connection,
+            new PublicKey(poolId),
+          );
+          const state = {
+            reserveYes: pm.reserveYes,
+            reserveNo: pm.reserveNo,
+          };
+          const oneSide = isOneSidedLiquidity(state);
+          const derived = deriveMarketProbabilityFromPoolState(state);
+          const synthetic: OmnipairPoolChainState = {
+            pairAddress: poolId,
+            token0Mint: yesMintId,
+            token1Mint: noMintId,
+            yesMint: yesMintId,
+            noMint: noMintId,
+            yesIsToken0: true,
+            decimalsYes: 6,
+            decimalsNo: 6,
+            reserveYes: pm.reserveYes,
+            reserveNo: pm.reserveNo,
+            reserve0Vault: poolId,
+            reserve1Vault: poolId,
+            vault0Amount: pm.reserveYes,
+            vault1Amount: pm.reserveNo,
+            pairReserve0: pm.reserveYes,
+            pairReserve1: pm.reserveNo,
+            swapFeeBps: 0,
+            lpMint: poolId,
+          };
+          if (!mounted.current) return;
+          setRpcDegradedMessage(null);
+          setEnginePoolMessage(null);
+          hadSuccessfulChainReadRef.current = true;
+          setChainSnapshot(synthetic);
+          setDerivedSnapshot(derived);
+          if (oneSide) {
+            setOneSidedLiquidity(true);
+            setUnavailable(false);
+            setYes(null);
+            setNo(null);
+            setRefreshEpoch((n) => n + 1);
+            return;
+          }
+          setOneSidedLiquidity(false);
+          if (!derived) {
+            setEnginePoolMessage(PMAMM_USER_STATE_MSG);
+            setUnavailable(true);
+            setYes(null);
+            setNo(null);
+            setRefreshEpoch((n) => n + 1);
+            return;
+          }
+          setUnavailable(false);
+          setYes(derived.yesProbability);
+          setNo(derived.noProbability);
+          setRefreshEpoch((n) => n + 1);
+          return;
+        }
+
         const state = await readOmnipairPoolState(connection, {
           pairAddress: new PublicKey(poolId),
           yesMint: new PublicKey(yesMintId),
@@ -163,6 +244,7 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
         if (!mounted.current) return;
 
         setRpcDegradedMessage(null);
+        setEnginePoolMessage(null);
         hadSuccessfulChainReadRef.current = true;
         setChainSnapshot(state);
         setDerivedSnapshot(derived);
@@ -250,6 +332,9 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
             setRpcDegradedMessage(
               "RPC is temporarily rate limited. Retrying…",
             );
+            if (engine === "PM_AMM") {
+              setEnginePoolMessage(null);
+            }
             if (!hadSuccessfulChainReadRef.current) {
               setUnavailable(true);
               setOneSidedLiquidity(false);
@@ -260,6 +345,11 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
             }
           } else {
             setRpcDegradedMessage(null);
+            if (engine === "PM_AMM") {
+              setEnginePoolMessage(PMAMM_USER_STATE_MSG);
+            } else {
+              setEnginePoolMessage(null);
+            }
             setUnavailable(true);
             setOneSidedLiquidity(false);
             setYes(null);
@@ -281,7 +371,7 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
         if (mounted.current) setLoading(false);
       }
     },
-    [connection, marketId, poolId, yesMintId, noMintId],
+    [connection, marketId, poolId, yesMintId, noMintId, engine],
   );
 
   useEffect(() => {
@@ -299,5 +389,6 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
     refresh,
     refreshEpoch,
     rpcDegradedMessage,
+    enginePoolMessage,
   };
 }

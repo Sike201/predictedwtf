@@ -1,3 +1,5 @@
+import type { MarketEngine } from "@/lib/types/market";
+
 /** Supabase `markets` row (prediction market lifecycle). */
 export type MarketStatus = "creating" | "live" | "failed";
 
@@ -38,6 +40,11 @@ export interface MarketRecord {
   last_known_no_price?: number | null;
   last_known_volume_usd?: number | null;
   last_stats_updated_at?: string | null;
+  market_engine?: MarketEngine | null;
+  onchain_program_id?: string | null;
+  pmamm_market_address?: string | null;
+  usdc_mint?: string | null;
+  pmamm_market_id?: string | null;
 }
 
 export interface CreateMarketPayload {

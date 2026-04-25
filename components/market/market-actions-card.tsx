@@ -240,7 +240,14 @@ export function MarketActionsCard({
     if (variant === "earn" && actionTab === "leverage") {
       setActionTab("buy");
     }
-  }, [variant, actionTab]);
+    if (
+      variant === "market" &&
+      market.engine === "PM_AMM" &&
+      actionTab === "leverage"
+    ) {
+      setActionTab("buy");
+    }
+  }, [variant, actionTab, market.engine]);
   const [lpSubmitting, setLpSubmitting] = useState(false);
   const [tradeInFlight, setTradeInFlight] = useState(false);
   const [txResult, setTxResult] = useState<TxResultState | null>(null);
@@ -311,8 +318,25 @@ export function MarketActionsCard({
     isResolved && winningSide ? winningSide : outcome;
 
   useEffect(() => {
-    if (isResolved) setActionTab("sell");
-  }, [isResolved, market.id]);
+    if (!isResolved) return;
+    if (variant === "earn") {
+      setActionTab("withdraw");
+    } else if (variant === "market") {
+      setActionTab("sell");
+    }
+  }, [isResolved, market.id, variant]);
+
+  function isActionTabDisabledByResolution(id: MarketActionTab): boolean {
+    if (!isResolved) return false;
+    if (variant === "earn") {
+      if (id === "deposit" || id === "buy") return true;
+      if (id === "sell") return !redeemFlags.hasWinningBalance;
+    }
+    if (variant === "market") {
+      if (id === "buy" || id === "leverage") return true;
+    }
+    return false;
+  }
 
   useEffect(() => {
     setTxResult(null);
@@ -327,6 +351,30 @@ export function MarketActionsCard({
     }
     setLpLoading(true);
     try {
+      if (market.engine === "PM_AMM") {
+        const qs = new URLSearchParams({
+          slug: market.id,
+          userWallet: publicKey.toBase58(),
+        });
+        const res = await fetch(`/api/market/pmamm-lp-position?${qs.toString()}`);
+        const j = (await res.json()) as {
+          error?: string;
+          userShares?: string;
+        };
+        if (!res.ok || j.error) {
+          setLpAtoms(null);
+          setUserOmLpAtaStr(null);
+          return;
+        }
+        setLpDecimals(0);
+        setUserOmLpAtaStr(null);
+        try {
+          setLpAtoms(BigInt(j.userShares ?? "0"));
+        } catch {
+          setLpAtoms(0n);
+        }
+        return;
+      }
       const programId = requireOmnipairProgramId();
       const pair = new PublicKey(market.pool.poolId);
       const info = await connection.getAccountInfo(pair, "confirmed");
@@ -990,6 +1038,13 @@ export function MarketActionsCard({
 
   const onDeposit = useCallback(async () => {
     setTxResult(null);
+    if (isResolved) {
+      setTxResult({
+        kind: "error",
+        message: "This market is resolved. Deposits are disabled.",
+      });
+      return;
+    }
     if (!connected || !publicKey || !signTransaction) {
       if (wallet) {
         try {
@@ -1062,6 +1117,7 @@ export function MarketActionsCard({
     signTransaction,
     setVisible,
     wallet,
+    isResolved,
   ]);
 
   const onWithdraw = useCallback(async () => {
@@ -1099,6 +1155,13 @@ export function MarketActionsCard({
       setTxResult({
         kind: "error",
         message: "Amount exceeds your omLP balance.",
+      });
+      return;
+    }
+    if (lpAtoms === 0n) {
+      setTxResult({
+        kind: "error",
+        message: "No liquidity position found.",
       });
       return;
     }
@@ -1325,7 +1388,9 @@ export function MarketActionsCard({
             ? ([
                 { id: "buy" as const, label: "Buy" },
                 { id: "sell" as const, label: "Sell" },
-                { id: "leverage" as const, label: "Leverage" },
+                ...(market.engine === "PM_AMM"
+                  ? []
+                  : [{ id: "leverage" as const, label: "Leverage" }]),
               ] as const)
             : ([
                 { id: "deposit" as const, label: "Deposit" },
@@ -1337,7 +1402,7 @@ export function MarketActionsCard({
           <button
             key={id}
             type="button"
-            disabled={anyLocked}
+            disabled={anyLocked || isActionTabDisabledByResolution(id)}
             onClick={() => setActionTab(id)}
             className={cn(
               "relative pb-2 text-[13px] font-medium transition disabled:cursor-not-allowed disabled:opacity-50 sm:text-[14px]",
@@ -1365,7 +1430,7 @@ export function MarketActionsCard({
               onChange={(e) => setDepositAmount(e.target.value)}
               inputMode="decimal"
               placeholder="0.00 USDC"
-              disabled={anyLocked}
+              disabled={anyLocked || isResolved}
               className="min-w-0 flex-1 border-0 bg-transparent text-right text-2xl font-semibold tabular-nums tracking-tight text-white outline-none placeholder:text-zinc-600 sm:text-[1.6rem]"
             />
           </div>
@@ -1373,7 +1438,7 @@ export function MarketActionsCard({
             <button
               type="button"
               onClick={onDeposit}
-              disabled={anyLocked}
+              disabled={anyLocked || isResolved}
               className={tradeButtonClass}
             >
               {lpSubmitting && actionTab === "deposit" ? "Confirming..." : "Confirm deposit"}
@@ -1390,6 +1455,19 @@ export function MarketActionsCard({
 
       {variant === "earn" && actionTab === "withdraw" && hasPool ? (
         <div className="mt-5">
+          {isResolved ? (
+            <p className="mb-3 rounded-lg border border-emerald-500/20 bg-emerald-950/20 px-3 py-2 text-[11px] font-medium leading-snug text-emerald-100/90 ring-1 ring-emerald-500/10">
+              Market resolved. You can still withdraw your liquidity position.
+            </p>
+          ) : null}
+          {connected &&
+          !lpLoading &&
+          lpAtoms !== null &&
+          lpAtoms === 0n ? (
+            <p className="mb-3 text-[12px] text-zinc-500" role="status">
+              No liquidity position found.
+            </p>
+          ) : null}
           {withdrawAdvancedRawTokens ? (
             <p className="text-[12px] leading-relaxed text-zinc-500">
               Burn omLP to receive YES and NO directly. A 1% protocol withdrawal
@@ -1909,7 +1987,7 @@ export function MarketActionsCard({
           {txResult.detailLine ? (
             <p className="mt-1 text-[11px] text-emerald-100/90">{txResult.detailLine}</p>
           ) : null}
-          <a
+          <a 
             href={devnetTxExplorerUrl(txResult.signature)}
             target="_blank"
             rel="noopener noreferrer"

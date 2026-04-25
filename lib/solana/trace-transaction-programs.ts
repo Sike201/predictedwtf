@@ -8,6 +8,10 @@ import {
 
 import { isPipelineStageError } from "@/lib/market/pipeline-errors";
 import {
+  isNativeSolInsufficientMessage,
+  isSplTokenInsufficientFundsMessage,
+} from "@/lib/market/tx-user-message";
+import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
@@ -164,7 +168,7 @@ export function tryLogSerializedTransaction(
 const SYSTEM_NATIVE = "11111111111111111111111111111111";
 const VOTE_PROGRAM = "Vote111111111111111111111111111111111111111";
 
-function collectSolanaErrorText(error: unknown): string {
+export function collectSolanaErrorDiagnostics(error: unknown): string {
   const parts: string[] = [];
   let cur: unknown = error;
   for (let d = 0; d < 10 && cur; d += 1) {
@@ -189,7 +193,19 @@ export function extractMissingProgramIdFromSolanaError(
   if (isPipelineStageError(error) && error.missingProgramId) {
     return error.missingProgramId;
   }
-  const blob = collectSolanaErrorText(error);
+  const blob = collectSolanaErrorDiagnostics(error);
+
+  if (isSplTokenInsufficientFundsMessage(blob)) return undefined;
+  if (isNativeSolInsufficientMessage(blob)) return undefined;
+
+  const skipInvokeProgram = new Set<string>([
+    SYSTEM_NATIVE,
+    VOTE_PROGRAM,
+    TOKEN_PROGRAM_ID.toBase58(),
+    ASSOCIATED_TOKEN_PROGRAM_ID.toBase58(),
+    TOKEN_2022_PROGRAM_ID.toBase58(),
+    MPL_TOKEN_METADATA_PROGRAM_ID.toBase58(),
+  ]);
 
   const invokePrograms: string[] = [];
   const reInvoke =
@@ -199,11 +215,9 @@ export function extractMissingProgramIdFromSolanaError(
     invokePrograms.push(m[1]!);
   }
   if (invokePrograms.length > 0) {
-    const last = invokePrograms[invokePrograms.length - 1]!;
-    if (last !== SYSTEM_NATIVE && last !== VOTE_PROGRAM) return last;
     for (let i = invokePrograms.length - 1; i >= 0; i -= 1) {
       const p = invokePrograms[i]!;
-      if (p !== SYSTEM_NATIVE && p !== VOTE_PROGRAM) return p;
+      if (!skipInvokeProgram.has(p)) return p;
     }
   }
 

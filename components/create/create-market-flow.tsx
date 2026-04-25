@@ -2,19 +2,35 @@
 
 import Image from "next/image";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { LayoutGroup, motion } from "framer-motion";
 import { ArrowLeft, ArrowUp, Loader2, Sparkles, Upload } from "lucide-react";
 import { TxExplorerLink } from "@/components/market/tx-explorer-link";
-import type { MarketDraft } from "@/lib/types/market";
+import type { MarketDraft, MarketEngine } from "@/lib/types/market";
 import type { MarketRecord } from "@/lib/types/market-record";
 import { pushRecentMarketTransaction } from "@/lib/market/recent-market-transactions";
 import { useWallet } from "@/lib/hooks/use-wallet";
+import { useConnection } from "@solana/wallet-adapter-react";
+import { Transaction } from "@solana/web3.js";
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  getAccount,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 import {
   devnetTxExplorerUrl,
   shortenTransactionSignature,
 } from "@/lib/utils/solana-explorer";
 import { cn } from "@/lib/utils/cn";
+import { parsePmammInitialLiquidityUsdcInput } from "@/lib/market/pmamm-initial-liquidity";
+import { formatPmammCollateralHuman } from "@/lib/solana/pmamm-initial-lp-preflight";
+import {
+  PMAMM_CONFIG,
+  PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN,
+} from "@/lib/solana/pmamm-config";
+
+const PMAMM_USDC_DECIMALS = 6;
 
 type ChatMsg = { role: "user" | "assistant"; text: string };
 
@@ -177,7 +193,8 @@ function Bubble({
 
 export function CreateMarketFlow() {
   const router = useRouter();
-  const { publicKey, connected } = useWallet();
+  const { connection } = useConnection();
+  const { publicKey, connected, signTransaction } = useWallet();
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<ChatMsg[]>([]);
@@ -190,6 +207,14 @@ export function CreateMarketFlow() {
   /** Base64 data URL for Pinata upload on create (set after FileReader read). */
   const [coverDataUrl, setCoverDataUrl] = useState<string | null>(null);
   const [creatingMarket, setCreatingMarket] = useState(false);
+  const [marketEngine, setMarketEngine] = useState<MarketEngine>("GAMM");
+  const [pmammInitialLiquidityUsdc, setPmammInitialLiquidityUsdc] = useState(
+    PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN,
+  );
+  const [yourPmammUsdcAtoms, setYourPmammUsdcAtoms] = useState<bigint | null>(
+    null,
+  );
+  const [yourPmammUsdcLoading, setYourPmammUsdcLoading] = useState(false);
   const [marketCreated, setMarketCreated] = useState<{
     slug: string;
     primarySig: string | null;
@@ -200,6 +225,9 @@ export function CreateMarketFlow() {
   } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastObjectUrl = useRef<string | null>(null);
+  const createSuccessNavTimer = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   useEffect(() => {
     scrollRef.current?.scrollTo({
@@ -225,9 +253,16 @@ export function CreateMarketFlow() {
     setCoverDataUrl(null);
     setCreatingMarket(false);
     setMarketCreated(null);
+    setPmammInitialLiquidityUsdc(PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN);
+    setYourPmammUsdcAtoms(null);
+    setYourPmammUsdcLoading(false);
   }
 
   function goToCreatedMarket() {
+    if (createSuccessNavTimer.current) {
+      clearTimeout(createSuccessNavTimer.current);
+      createSuccessNavTimer.current = null;
+    }
     if (!marketCreated) return;
     const sig =
       marketCreated.primarySig ??
@@ -248,39 +283,355 @@ export function CreateMarketFlow() {
     router.push(`/markets/${encodeURIComponent(marketCreated.slug)}`);
   }
 
+  /** After a successful create, show success UI briefly then open the new market. */
+  useEffect(() => {
+    if (!marketCreated) return;
+    const m = marketCreated;
+    createSuccessNavTimer.current = setTimeout(() => {
+      createSuccessNavTimer.current = null;
+      const sig = m.primarySig ?? m.poolInitTx ?? m.mintYesTx ?? null;
+      if (sig) {
+        pushRecentMarketTransaction(
+          m.slug,
+          {
+            action: "create_market",
+            amount: "Market setup",
+            signature: sig,
+          },
+          publicKey?.toBase58(),
+        );
+      }
+      router.push(`/markets/${encodeURIComponent(m.slug)}`);
+    }, 2000);
+    return () => {
+      if (createSuccessNavTimer.current) {
+        clearTimeout(createSuccessNavTimer.current);
+        createSuccessNavTimer.current = null;
+      }
+    };
+  }, [marketCreated, publicKey, router]);
+
+  const pmammLiqParsed = useMemo(() => {
+    if (marketEngine !== "PM_AMM") {
+      return { ok: true as const, atoms: 0n, humanForLog: "" };
+    }
+    return parsePmammInitialLiquidityUsdcInput(pmammInitialLiquidityUsdc);
+  }, [marketEngine, pmammInitialLiquidityUsdc]);
+
+  const pmammBalanceExceeded =
+    marketEngine === "PM_AMM" &&
+    pmammLiqParsed.ok &&
+    yourPmammUsdcAtoms !== null &&
+    pmammLiqParsed.atoms > yourPmammUsdcAtoms;
+
+  useEffect(() => {
+    if (marketEngine !== "PM_AMM" || !publicKey || !connection) {
+      setYourPmammUsdcAtoms(null);
+      setYourPmammUsdcLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setYourPmammUsdcLoading(true);
+    void (async () => {
+      try {
+        const mint = PMAMM_CONFIG.collateralMint;
+        const ata = getAssociatedTokenAddressSync(
+          mint,
+          publicKey,
+          false,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID,
+        );
+        const acc = await getAccount(connection, ata, "confirmed");
+        if (!cancelled) setYourPmammUsdcAtoms(acc.amount);
+      } catch {
+        if (!cancelled) setYourPmammUsdcAtoms(0n);
+      } finally {
+        if (!cancelled) setYourPmammUsdcLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [marketEngine, publicKey, connection]);
+
+  const pmammLiquidityFormOk =
+    marketEngine !== "PM_AMM" ||
+    (pmammLiqParsed.ok && !pmammBalanceExceeded);
+
+  const pmammCanSign =
+    marketEngine !== "PM_AMM" || (!!signTransaction && !!connection);
+
+  const formReady =
+    draft != null &&
+    imagePreview != null &&
+    imageRelated === true &&
+    !imageChecking &&
+    connected &&
+    publicKey != null &&
+    pmammLiquidityFormOk &&
+    pmammCanSign;
+
+  const createBlockedReason = (() => {
+    if (!draft) return null;
+    if (!connected || !publicKey) {
+      return "Connect wallet to create a market.";
+    }
+    if (imageChecking) {
+      return "Verifying image…";
+    }
+    if (!imagePreview) {
+      return "Add a cover image to continue.";
+    }
+    if (imageRelated !== true) {
+      return "Upload an image that matches this market, or pick a different file.";
+    }
+    if (
+      marketEngine === "PM_AMM" &&
+      (!signTransaction || !connection)
+    ) {
+      return "Use a wallet that can sign transactions — pmAMM initial liquidity is deposited from your connected wallet.";
+    }
+    return null;
+  })();
+
   async function handleCreateMarket() {
-    if (!draft || !publicKey || creatingMarket) return;
+    if (!draft || !publicKey || creatingMarket) {
+      console.info("[predicted][create-ui] create market skipped (guard)", {
+        hasDraft: Boolean(draft),
+        hasPublicKey: Boolean(publicKey),
+        creatingMarket,
+      });
+      return;
+    }
+
+    const payload = {
+      draft,
+      creatorWallet: publicKey.toBase58(),
+      imageDataUrl: coverDataUrl ?? undefined,
+      engine: marketEngine,
+      ...(marketEngine === "PM_AMM"
+        ? { initialLiquidityUsdc: pmammInitialLiquidityUsdc.trim() }
+        : {}),
+    };
+    console.info("[predicted][create-ui] create market clicked", {
+        hasDraft: true,
+        creatorWallet: publicKey.toBase58(),
+        marketEngine,
+        initialLiquidityUsdc:
+          marketEngine === "PM_AMM"
+            ? pmammInitialLiquidityUsdc.trim()
+            : undefined,
+        hasImageDataUrl: Boolean(coverDataUrl),
+        imageDataUrlBytes:
+          coverDataUrl != null
+            ? Math.ceil((coverDataUrl.length * 3) / 4)
+            : 0,
+        formReady,
+        draftSummary: {
+          question: draft.question?.slice(0, 80),
+          resolutionRules: draft.resolutionRules?.slice(0, 200),
+          hasExpiry: Boolean(draft.expiry?.trim?.()),
+        },
+        imageState: { imagePreview: Boolean(imagePreview), imageRelated, imageChecking },
+      });
+
     setCreatingMarket(true);
     try {
       const res = await fetch("/api/market/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          draft,
-          creatorWallet: publicKey.toBase58(),
-          imageDataUrl: coverDataUrl ?? undefined,
-        }),
+        body: JSON.stringify(payload),
       });
-      const json = (await res.json()) as {
+      const rawText = await res.text();
+      console.info("[predicted][create-ui] create API response", {
+        status: res.status,
+        ok: res.ok,
+        bodyPreview: rawText.slice(0, 2000),
+      });
+      let json: {
         market?: MarketRecord;
         error?: string;
-      };
+        stage?: string;
+        missingProgramId?: string;
+        outcomeAtaContext?: Record<string, string>;
+      } = {};
+      try {
+        json = (rawText ? JSON.parse(rawText) : {}) as typeof json;
+      } catch (parseErr) {
+        console.error("[predicted][create-ui] create API: JSON parse error", {
+            parseErr,
+            rawText: rawText.slice(0, 500),
+          });
+        setMessages((m) => [
+          ...m,
+          {
+            role: "assistant",
+            text: `Create market failed: server returned non-JSON (HTTP ${res.status}). ${rawText.slice(0, 200)}`,
+          },
+        ]);
+        return;
+      }
       if (!res.ok) {
+        const detail = [
+          json.error && `Error: ${json.error}`,
+          json.stage && `Stage: ${json.stage}`,
+          json.missingProgramId && `Program id hint: ${json.missingProgramId}`,
+          json.outcomeAtaContext &&
+            `ATA debug: ${JSON.stringify(json.outcomeAtaContext, null, 2)}`,
+        ]
+          .filter(Boolean)
+          .join("\n");
+        console.error("[predicted][create-ui] create API error", {
+            status: res.status,
+            ...json,
+          });
         setMessages((m) => [
           ...m,
           {
             role: "assistant",
             text:
-              json.error ??
+              detail ||
               "Could not create this market. Try again or check configuration.",
           },
         ]);
         return;
       }
+
+      const phase = (json as { phase?: string }).phase;
+      const depositB64 = (json as { depositTransaction?: string })
+        .depositTransaction;
+
+      if (
+        res.ok &&
+        phase === "pmamm_await_user_deposit" &&
+        depositB64 &&
+        json.market?.slug
+      ) {
+        if (!signTransaction || !connection) {
+          setMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              text: "Cannot sign the liquidity deposit — use a wallet that supports signing transactions.",
+            },
+          ]);
+          return;
+        }
+        try {
+          const tx = Transaction.from(Buffer.from(depositB64, "base64"));
+          const signed = await signTransaction(tx);
+          const depositSig = await connection.sendRawTransaction(
+            signed.serialize(),
+            { skipPreflight: false },
+          );
+          await connection.confirmTransaction(depositSig, "confirmed");
+          const completeRes = await fetch(
+            "/api/market/create/complete-pmamm-deposit",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                slug: json.market.slug,
+                creatorWallet: publicKey.toBase58(),
+                depositSignature: depositSig,
+              }),
+            },
+          );
+          const completeText = await completeRes.text();
+          let completeJson: {
+            market?: MarketRecord;
+            error?: string;
+            stage?: string;
+          } = {};
+          try {
+            completeJson = (
+              completeText ? JSON.parse(completeText) : {}
+            ) as typeof completeJson;
+          } catch {
+            setMessages((m) => [
+              ...m,
+              {
+                role: "assistant",
+                text: `Deposit submitted (${depositSig.slice(0, 12)}…) but finalize response was invalid. Check your market or try again.`,
+              },
+            ]);
+            return;
+          }
+          if (!completeRes.ok) {
+            const detail = [
+              completeJson.error && `Error: ${completeJson.error}`,
+              completeJson.stage && `Stage: ${completeJson.stage}`,
+            ]
+              .filter(Boolean)
+              .join("\n");
+            setMessages((m) => [
+              ...m,
+              {
+                role: "assistant",
+                text:
+                  detail ||
+                  "Could not finalize the market after your deposit. Check devnet and try again.",
+              },
+            ]);
+            return;
+          }
+          const final = completeJson.market;
+          if (!final?.slug) {
+            setMessages((m) => [
+              ...m,
+              {
+                role: "assistant",
+                text: "Finalize step returned no market. Check server logs.",
+              },
+            ]);
+            return;
+          }
+          const primarySig =
+            final.seed_liquidity_tx ??
+            final.pool_init_tx ??
+            final.created_tx ??
+            null;
+          console.info("[predicted][create-ui] pmAMM create complete", {
+            slug: final.slug,
+            depositSig,
+            primarySig,
+          });
+          setMarketCreated({
+            slug: final.slug,
+            primarySig,
+            mintYesTx: final.mint_yes_tx ?? null,
+            mintNoTx: final.mint_no_tx ?? null,
+            poolInitTx: final.pool_init_tx ?? null,
+            seedLiquidityTx: final.seed_liquidity_tx ?? null,
+          });
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e);
+          console.error(
+            "[predicted][create-ui] pmAMM deposit sign/send failed",
+            e,
+          );
+          setMessages((m) => [
+            ...m,
+            {
+              role: "assistant",
+              text: `Liquidity deposit failed: ${errMsg || "Wallet or network error"}.`,
+            },
+          ]);
+        }
+        return;
+      }
+
       if (json.market?.slug) {
         const m = json.market;
         const primarySig =
           m.created_tx ?? m.pool_init_tx ?? m.mint_yes_tx ?? null;
+        console.info("[predicted][create-ui] create market success", {
+            slug: m.slug,
+            primarySig,
+            pool_init_tx: m.pool_init_tx,
+            created_tx: m.created_tx,
+          });
         setMarketCreated({
           slug: m.slug,
           primarySig,
@@ -291,12 +642,25 @@ export function CreateMarketFlow() {
         });
         return;
       }
-    } catch {
+      console.error(
+          "[predicted][create-ui] create API: ok but no market.slug in body",
+          json,
+        );
       setMessages((m) => [
         ...m,
         {
           role: "assistant",
-          text: "Network error while creating the market.",
+          text: `Create market returned an unexpected response (no market slug). Check server logs. Body: ${rawText.slice(0, 400)}`,
+        },
+      ]);
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error("[predicted][create-ui] create market client exception", e);
+      setMessages((m) => [
+        ...m,
+        {
+          role: "assistant",
+          text: `Create market failed: ${errMsg || "Network error"}`,
         },
       ]);
     } finally {
@@ -443,23 +807,6 @@ export function CreateMarketFlow() {
       setBusy(false);
     }
   }
-
-  const formReady =
-    draft != null &&
-    imagePreview != null &&
-    imageRelated === true &&
-    !imageChecking &&
-    connected &&
-    publicKey != null;
-
-  const createBlockedReason = (() => {
-    if (!draft) return null;
-    if (!connected || !publicKey) return "Connect your Solana wallet to create.";
-    if (imageChecking) return null;
-    if (!imagePreview) return null;
-    if (imageRelated !== true) return null;
-    return null;
-  })();
 
   return (
     <div className="relative flex min-h-[calc(100dvh-52px)] w-full flex-col overflow-hidden lg:min-h-[calc(100dvh-56px)]">
@@ -661,6 +1008,114 @@ export function CreateMarketFlow() {
                         </p>
                       )}
 
+                      {!marketCreated && draft ? (
+                        <div
+                          className="flex items-center justify-center gap-1 rounded-xl border border-white/[0.08] bg-white/[0.03] p-1"
+                          role="group"
+                          aria-label="Market engine"
+                        >
+                          {(
+                            [
+                              { id: "GAMM" as const, label: "GAMM" },
+                              { id: "PM_AMM" as const, label: "pmAMM" },
+                            ] as const
+                          ).map(({ id, label }) => (
+                            <button
+                              key={id}
+                              type="button"
+                              disabled={creatingMarket}
+                              onClick={() => setMarketEngine(id)}
+                              className={cn(
+                                "min-h-[40px] flex-1 rounded-lg px-3 text-[12px] font-semibold transition",
+                                marketEngine === id
+                                  ? "bg-white text-[#0a0a0c]"
+                                  : "text-zinc-400 hover:text-zinc-200",
+                              )}
+                            >
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {marketEngine === "PM_AMM" && !marketCreated ? (
+                        <div className="space-y-2 rounded-xl border border-white/[0.08] bg-white/[0.03] px-3 py-3">
+                          <label
+                            htmlFor="pmamm-initial-liquidity"
+                            className="block text-[11px] font-medium text-zinc-300"
+                          >
+                            Initial Liquidity
+                          </label>
+                          <input
+                            id="pmamm-initial-liquidity"
+                            type="text"
+                            inputMode="decimal"
+                            autoComplete="off"
+                            placeholder={`${PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN} USDC`}
+                            value={pmammInitialLiquidityUsdc}
+                            onChange={(e) =>
+                              setPmammInitialLiquidityUsdc(e.target.value)
+                            }
+                            disabled={creatingMarket}
+                            className="w-full rounded-lg border border-white/[0.1] bg-black/25 px-3 py-2 text-[13px] text-zinc-100 placeholder:text-zinc-600 focus:border-white/[0.2] focus:outline-none disabled:opacity-45"
+                          />
+                          <p className="text-[10px] leading-relaxed text-zinc-500">
+                            Recommended: 1000 USDC. You can start smaller for
+                            testing.
+                          </p>
+                          <p className="text-[10px] leading-relaxed text-zinc-500">
+                            Higher liquidity reduces slippage and makes the
+                            market easier to trade.
+                          </p>
+                          <p className="text-[10px] leading-relaxed text-zinc-600">
+                            Initial liquidity is deposited from your connected
+                            wallet. After you click create, approve the liquidity
+                            deposit in your wallet — you pay SOL fees and USDC,
+                            and you receive the LP position.
+                          </p>
+                          {yourPmammUsdcLoading ? (
+                            <p className="flex items-center gap-2 text-[10px] text-zinc-500">
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                              Loading your USDC balance…
+                            </p>
+                          ) : yourPmammUsdcAtoms !== null && pmammLiqParsed.ok ? (
+                            <p className="text-[10px] leading-relaxed text-zinc-500">
+                              Your wallet has{" "}
+                              {formatPmammCollateralHuman(
+                                yourPmammUsdcAtoms,
+                                PMAMM_USDC_DECIMALS,
+                              )}{" "}
+                              USDC (mint{" "}
+                              <span className="font-mono text-zinc-600">
+                                {PMAMM_CONFIG.collateralMint.toBase58().slice(0, 6)}
+                                …
+                              </span>
+                              ).
+                            </p>
+                          ) : null}
+                          {!pmammLiqParsed.ok ? (
+                            <p className="text-[11px] leading-relaxed text-amber-200/90">
+                              {pmammLiqParsed.error}
+                            </p>
+                          ) : null}
+                          {pmammBalanceExceeded ? (
+                            <p className="text-[11px] leading-relaxed text-amber-200/90">
+                              You need{" "}
+                              {formatPmammCollateralHuman(
+                                pmammLiqParsed.atoms,
+                                PMAMM_USDC_DECIMALS,
+                              )}{" "}
+                              USDC, but your wallet has{" "}
+                              {formatPmammCollateralHuman(
+                                yourPmammUsdcAtoms!,
+                                PMAMM_USDC_DECIMALS,
+                              )}{" "}
+                              USDC.
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+
                       {marketCreated ? (
                         <div className="space-y-3 rounded-xl border border-emerald-500/25 bg-emerald-950/25 px-4 py-4 ring-1 ring-emerald-500/15">
                           <div>
@@ -746,7 +1201,7 @@ export function CreateMarketFlow() {
                           ) : (
                             <Sparkles className="h-4 w-4" />
                           )}
-                          {creatingMarket ? "Creating market…" : "Create market"}
+                          {creatingMarket ? "Creating…" : "Create market"}
                         </motion.button>
                       )}
                     </motion.div>

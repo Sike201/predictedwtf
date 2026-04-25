@@ -1,3 +1,9 @@
+import { BN } from "@coral-xyz/anchor";
+import {
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 import { PublicKey } from "@solana/web3.js";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import { pinMarketImageToIpfs } from "@/lib/storage/pinata";
@@ -26,9 +32,14 @@ import { getOmnipairProgramId } from "@/lib/solana/omnipair-program";
 import { seedMarketLiquidity } from "@/lib/solana/seed-market-liquidity";
 import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
 import {
+  collectSolanaErrorDiagnostics,
   extractMissingProgramIdFromSolanaError,
   formatMissingDeployedProgramMessage,
 } from "@/lib/solana/trace-transaction-programs";
+import {
+  isNativeSolInsufficientMessage,
+  isSplTokenInsufficientFundsMessage,
+} from "@/lib/market/tx-user-message";
 import {
   formatMarketEndTimeIsoForDatabase,
   isDateOnlyUtcCalendarInput,
@@ -38,7 +49,25 @@ import {
 import { classifyMarketCategoryWithGrok } from "@/lib/market/grok-classify-market-category";
 import { TRUSTED_RESOLVER_ADDRESS } from "@/lib/market/trusted-resolver";
 import type { MarketRecord, MarketStatus } from "@/lib/types/market-record";
-import type { MarketDraft } from "@/lib/types/market";
+import type { MarketDraft, MarketEngine } from "@/lib/types/market";
+import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import {
+  pmammBuildDepositLiquidityUserTransaction,
+  pmammBuildInitializeMarketTransaction,
+} from "@/lib/engines/pmamm";
+import { pmammMarketIdBnFromSeed } from "@/lib/solana/pmamm-market-id";
+import { derivePmammLpPda } from "@/lib/solana/pmamm-pda";
+import { assertPmammDepositTxFromCreator } from "@/lib/solana/pmamm-verify-user-deposit-tx";
+import {
+  getPmammCollateralMint,
+  requirePmammProgramId,
+} from "@/lib/solana/pmamm-config";
+import { parsePmammInitialLiquidityUsdcInput } from "@/lib/market/pmamm-initial-liquidity";
+import { validatePmammCollateralMint } from "@/lib/solana/pmamm-validate-collateral";
+import {
+  preflightPmammInitialLpUsdc,
+  readPmammDepositorUsdcBalance,
+} from "@/lib/solana/pmamm-initial-lp-preflight";
 
 const LP = "[predicted][pipeline]";
 const CREATE_LIFECYCLE_LOG = "[predicted][create-market-lifecycle]";
@@ -64,10 +93,24 @@ export type CreateMarketInput = {
   noCondition?: string;
   /** Base64 data URL — uploaded to Pinata before insert. */
   imageDataUrl?: string;
+  /** On-chain engine (default Omnipair GAMM). */
+  engine?: MarketEngine;
+  /**
+   * Human USDC string (6 dp) for pmAMM `deposit_liquidity` seed; ignored for GAMM.
+   * Empty uses default 1000 USDC.
+   */
+  initialLiquidityUsdc?: string;
 };
 
 export type CreateMarketResult =
-  | { ok: true; market: MarketRecord }
+  | {
+      ok: true;
+      market: MarketRecord;
+      /** Creator must sign and submit this tx (pmAMM create only). */
+      pmammAwaitingUserDeposit?: {
+        depositTransactionBase64: string;
+      };
+    }
   | {
       ok: false;
       error: string;
@@ -75,6 +118,8 @@ export type CreateMarketResult =
       stage?: PipelineFailureStage;
       /** On-chain: program account not found / load failure (from simulation logs). */
       missingProgramId?: string;
+      /** `FAILED_AT_OUTCOME_ATA` — engine ATA / mint / program debugging context. */
+      outcomeAtaContext?: Record<string, string>;
     };
 
 function makeSlug(title: string): string {
@@ -141,6 +186,8 @@ export async function createMarketPipeline(
     input.noCondition,
   );
   const slug = makeSlug(input.draft.question);
+  const engine: MarketEngine =
+    input.engine === "PM_AMM" ? "PM_AMM" : "GAMM";
   const draftExpiryRaw = input.draft.expiry;
   const expiryResolved = resolveMarketExpiryInputForDatabase({
     draftExpiry: draftExpiryRaw,
@@ -199,6 +246,7 @@ export async function createMarketPipeline(
     resolution_status: "active" as const,
     status: "creating" as const,
     image_cid: imageCid,
+    market_engine: engine,
   };
   console.info(
     CREATE_LIFECYCLE_LOG,
@@ -260,7 +308,7 @@ export async function createMarketPipeline(
 
   try {
     const mockChain = process.env.MOCK_CHAIN === "1";
-    const programId = getOmnipairProgramId();
+    let omnipairProgramPk: PublicKey | null = null;
 
     let yesMint: PublicKey;
     let noMint: PublicKey;
@@ -272,8 +320,197 @@ export async function createMarketPipeline(
     let createdTxSig: string | null = null;
     let authorityYesAta: PublicKey | null = null;
     let authorityNoAta: PublicKey | null = null;
+    let pmammMarketIdStr: string | null = null;
 
-    if (mockChain) {
+    if (engine === "PM_AMM") {
+      if (mockChain) {
+        throw new PipelineStageError(
+          "FAILED_AT_PRECONDITION",
+          "PM_AMM markets require a live chain (disable MOCK_CHAIN).",
+        );
+      }
+      if (process.env.PMAMM_EXECUTE_INIT !== "true") {
+        throw new PipelineStageError(
+          "FAILED_AT_PRECONDITION",
+          "Set PMAMM_EXECUTE_INIT=true to create pmAMM markets on devnet.",
+        );
+      }
+      const treasury = loadMarketEngineAuthority();
+      if (!treasury) {
+        throw new PipelineStageError(
+          "FAILED_AT_PRECONDITION",
+          "Set MARKET_ENGINE_AUTHORITY_SECRET (pmAMM market authority).",
+        );
+      }
+      const collateralMintPk = getPmammCollateralMint();
+      await validatePmammCollateralMint(connection, collateralMintPk);
+      const liqParsed = parsePmammInitialLiquidityUsdcInput(
+        input.initialLiquidityUsdc,
+      );
+      if (!liqParsed.ok) {
+        throw new PipelineStageError("FAILED_AT_PRECONDITION", liqParsed.error);
+      }
+      const pmammInitialLiquidityAtoms = liqParsed.atoms;
+      console.info(`${LP} pmAMM initial liquidity (creator-funded deposit)`, {
+        humanInput: liqParsed.humanForLog,
+        usdcAtoms: pmammInitialLiquidityAtoms.toString(),
+        connectedCreator: creator.toBase58(),
+        initAuthority: "MARKET_ENGINE_AUTHORITY (server) for initialize_market only",
+      });
+      const marketIdBn = pmammMarketIdBnFromSeed(`${slug}:${marketId}`);
+      pmammMarketIdStr = marketIdBn.toString();
+      const endTsSec = Math.floor(new Date(expiryTs).getTime() / 1000);
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (!Number.isFinite(endTsSec) || endTsSec <= nowSec + 300) {
+        throw new PipelineStageError(
+          "FAILED_AT_PRECONDITION",
+          "pmAMM requires market end time at least 5 minutes in the future (on-chain rule).",
+        );
+      }
+      const onChainName = slug.slice(0, 64).trim() || "market";
+      console.info(`${LP} BEFORE pmAMM initialize_market`, {
+        marketId: pmammMarketIdStr,
+        endTs: endTsSec,
+      });
+      try {
+        const built = await pmammBuildInitializeMarketTransaction({
+          connection,
+          authority: treasury.publicKey,
+          marketId: marketIdBn,
+          endTs: new BN(endTsSec),
+          name: onChainName,
+        });
+        built.transaction.partialSign(treasury);
+        const sigI = await connection.sendRawTransaction(
+          built.transaction.serialize(),
+          { skipPreflight: false },
+        );
+        await connection.confirmTransaction(sigI, "confirmed");
+        poolInitTx = sigI;
+        createdTxSig = sigI;
+        yesMint = built.yesMint;
+        noMint = built.noMint;
+        poolAddress = built.marketPda;
+      } catch (e) {
+        if (isPipelineStageError(e)) throw e;
+        throw solanaPipelineStage("FAILED_AT_PMAMM_INIT", formatUnknownError(e), e);
+      }
+      let depositTransactionBase64: string;
+      try {
+        await preflightPmammInitialLpUsdc({
+          connection,
+          collateralMint: collateralMintPk,
+          collateralDecimals: 6,
+          depositor: creator,
+          requiredAtoms: pmammInitialLiquidityAtoms,
+          role: "CREATOR_WALLET",
+        });
+        const programPk = requirePmammProgramId();
+        const userCollateralAta = getAssociatedTokenAddressSync(
+          collateralMintPk,
+          creator,
+          false,
+          TOKEN_PROGRAM_ID,
+          ASSOCIATED_TOKEN_PROGRAM_ID,
+        );
+        const lpReceiverPda = derivePmammLpPda(
+          poolAddress,
+          creator,
+          programPk,
+        );
+        let userBalAtoms = 0n;
+        try {
+          const { balanceAtoms } = await readPmammDepositorUsdcBalance({
+            connection,
+            collateralMint: collateralMintPk,
+            depositor: creator,
+          });
+          userBalAtoms = balanceAtoms;
+        } catch {
+          userBalAtoms = 0n;
+        }
+        console.info(`${LP} pmAMM deposit_liquidity tx (unsigned, creator signs)`, {
+          connectedWallet: creator.toBase58(),
+          initialLpDepositor: creator.toBase58(),
+          usdcSourceAta: userCollateralAta.toBase58(),
+          lpReceiver: lpReceiverPda.toBase58(),
+          requiredUsdcAtoms: pmammInitialLiquidityAtoms.toString(),
+          userUsdcBalanceAtoms: userBalAtoms.toString(),
+          collateralDecimals: 6,
+        });
+        const depTx = await pmammBuildDepositLiquidityUserTransaction({
+          connection,
+          user: creator,
+          marketPda: poolAddress,
+          amountAtoms: new BN(pmammInitialLiquidityAtoms.toString()),
+        });
+        depositTransactionBase64 = Buffer.from(
+          depTx.serialize({
+            requireAllSignatures: false,
+            verifySignatures: false,
+          }),
+        ).toString("base64");
+      } catch (e) {
+        if (isPipelineStageError(e)) throw e;
+        const diag = collectSolanaErrorDiagnostics(e);
+        let msg = formatUnknownError(e);
+        if (isSplTokenInsufficientFundsMessage(diag)) {
+          msg =
+            "Insufficient USDC in the creator wallet to build the initial liquidity deposit.";
+        } else if (isNativeSolInsufficientMessage(diag)) {
+          msg =
+            "Not enough SOL in the creator wallet to pay fees for the liquidity deposit.";
+        }
+        throw solanaPipelineStage("FAILED_AT_PMAMM_DEPOSIT", msg, e);
+      }
+
+      try {
+        const { data: creatingRow, error: midErr } = await sb
+          .from("markets")
+          .update({
+            yes_mint: yesMint.toBase58(),
+            no_mint: noMint.toBase58(),
+            pool_address: poolAddress.toBase58(),
+            status: "creating",
+            created_tx: createdTxSig ?? poolInitTx,
+            mint_yes_tx: null,
+            mint_no_tx: null,
+            pool_init_tx: poolInitTx,
+            seed_liquidity_tx: null,
+            market_engine: engine,
+            onchain_program_id: requirePmammProgramId().toBase58(),
+            pmamm_market_address: poolAddress.toBase58(),
+            usdc_mint: getPmammCollateralMint().toBase58(),
+            pmamm_market_id: pmammMarketIdStr,
+          })
+          .eq("id", marketId)
+          .select()
+          .single();
+
+        if (midErr || !creatingRow) {
+          throw new PipelineStageError(
+            "FAILED_AT_SUPABASE_FINAL",
+            midErr?.message ??
+              "Failed to persist market after pmAMM initialize_market.",
+          );
+        }
+        console.info(`${LP} pmAMM pipeline paused for user-signed deposit`, {
+          slug: (creatingRow as MarketRecord).slug,
+          creator: creator.toBase58(),
+        });
+        return {
+          ok: true,
+          market: creatingRow as MarketRecord,
+          pmammAwaitingUserDeposit: { depositTransactionBase64 },
+        };
+      } catch (e) {
+        if (isPipelineStageError(e)) throw e;
+        throw new PipelineStageError("FAILED_AT_SUPABASE_FINAL", formatUnknownError(e), {
+          cause: e,
+        });
+      }
+    } else if (mockChain) {
+      omnipairProgramPk = getOmnipairProgramId();
       console.info(`${LP} MOCK_CHAIN=1 — stub chain steps`);
       const m = createMockOutcomeMints();
       yesMint = m.yesMint;
@@ -281,7 +518,7 @@ export async function createMarketPipeline(
       authorityYesAta = m.authorityYesAta;
       authorityNoAta = m.authorityNoAta;
       poolAddress = deriveOmnipairMarketAccounts(
-        programId,
+        omnipairProgramPk,
         yesMint,
         noMint,
       ).pairAddress;
@@ -289,6 +526,7 @@ export async function createMarketPipeline(
         `${LP} MOCK_CHAIN=1 — fake mints and PDAs; not real devnet assets.`,
       );
     } else {
+      omnipairProgramPk = getOmnipairProgramId();
       const treasury = loadMarketEngineAuthority();
       if (!treasury) {
         throw new PipelineStageError(
@@ -361,9 +599,17 @@ export async function createMarketPipeline(
           authorityNoAta: authorityNoAta.toBase58(),
         });
       } catch (e) {
+        if (isPipelineStageError(e) && e.stage === "FAILED_AT_OUTCOME_ATA") {
+          console.error(
+            `${LP} outcome ATA setup failed (structured)`,
+            e.outcomeAtaContext,
+            e,
+          );
+          throw e;
+        }
         const msg = formatUnknownError(e);
         console.error(`${LP} outcome ATA setup failed`, msg, e);
-        throw solanaPipelineStage("FAILED_AT_OUTCOME_ATA", msg, e);
+        throw new PipelineStageError("FAILED_AT_OUTCOME_ATA", msg, { cause: e });
       }
 
       /** Omnipair path: bootstrap mint happens inside `initializeOmnipairMarket` as tx2 (after pre-init). */
@@ -435,6 +681,13 @@ export async function createMarketPipeline(
           last_known_no_price: 0.5,
           last_known_volume_usd: 0,
           last_stats_updated_at: new Date().toISOString(),
+          market_engine: engine,
+          onchain_program_id: (
+            omnipairProgramPk ?? getOmnipairProgramId()
+          ).toBase58(),
+          pmamm_market_address: null,
+          usdc_mint: DEVNET_USDC_MINT.toBase58(),
+          pmamm_market_id: pmammMarketIdStr,
         })
         .eq("id", marketId)
         .select()
@@ -465,60 +718,61 @@ export async function createMarketPipeline(
       if (!mockChain) {
         const seedSig = seedTx ?? poolInitTx ?? createdTxSig;
         if (seedSig) {
-          try {
-            const snap = await recordMarketPriceSnapshotFromChain({
-              marketId: (live as MarketRecord).id,
-              txSignature: seedSig,
-              connection,
-              pairAddress: poolAddress,
-              yesMint,
-              noMint,
-            });
-            if (!snap.ok) {
-              console.warn(`${LP} initial market_price_history failed`, snap.error);
-              const repair = await seedMarketPriceHistoryIfEmpty(
-                (live as MarketRecord).slug,
-              );
-              if (repair.ok && repair.seeded) {
-                console.info(
-                  `${LP} chart history repaired via seed after failed snapshot`,
-                );
-              } else if (!repair.ok) {
-                console.warn(`${LP} chart seed failed`, repair.error);
-              }
-            }
-          } catch (e) {
-            console.warn(
-              `${LP} initial market_price_history exception`,
-              formatUnknownError(e),
-            );
             try {
-              const repair = await seedMarketPriceHistoryIfEmpty(
-                (live as MarketRecord).slug,
-              );
-              if (repair.ok && repair.seeded) {
-                console.info(
-                  `${LP} chart history repaired via seed after exception`,
+              const snap = await recordMarketPriceSnapshotFromChain({
+                marketId: (live as MarketRecord).id,
+                txSignature: seedSig,
+                connection,
+                pairAddress: poolAddress,
+                yesMint,
+                noMint,
+                marketEngineHint: "GAMM",
+              });
+              if (!snap.ok) {
+                console.warn(`${LP} initial market_price_history failed`, snap.error);
+                const repair = await seedMarketPriceHistoryIfEmpty(
+                  (live as MarketRecord).slug,
                 );
-              } else if (!repair.ok) {
-                console.warn(`${LP} chart seed failed`, repair.error);
+                if (repair.ok && repair.seeded) {
+                  console.info(
+                    `${LP} chart history repaired via seed after failed snapshot`,
+                  );
+                } else if (!repair.ok) {
+                  console.warn(`${LP} chart seed failed`, repair.error);
+                }
               }
-            } catch {
-              /* ignore */
+            } catch (e) {
+              console.warn(
+                `${LP} initial market_price_history exception`,
+                formatUnknownError(e),
+              );
+              try {
+                const repair = await seedMarketPriceHistoryIfEmpty(
+                  (live as MarketRecord).slug,
+                );
+                if (repair.ok && repair.seeded) {
+                  console.info(
+                    `${LP} chart history repaired via seed after exception`,
+                  );
+                } else if (!repair.ok) {
+                  console.warn(`${LP} chart seed failed`, repair.error);
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+          } else {
+            const repair = await seedMarketPriceHistoryIfEmpty(
+              (live as MarketRecord).slug,
+            );
+            if (repair.ok && repair.seeded) {
+              console.info(
+                `${LP} chart history seeded (no bootstrap tx sig on record)`,
+              );
+            } else if (!repair.ok) {
+              console.warn(`${LP} chart seed failed`, repair.error);
             }
           }
-        } else {
-          const repair = await seedMarketPriceHistoryIfEmpty(
-            (live as MarketRecord).slug,
-          );
-          if (repair.ok && repair.seeded) {
-            console.info(
-              `${LP} chart history seeded (no bootstrap tx sig on record)`,
-            );
-          } else if (!repair.ok) {
-            console.warn(`${LP} chart seed failed`, repair.error);
-          }
-        }
       }
 
       return { ok: true, market: live as MarketRecord };
@@ -548,6 +802,10 @@ export async function createMarketPipeline(
     const errorMessage = missingProgramId
       ? `${formatMissingDeployedProgramMessage(missingProgramId)} — ${message}`
       : message;
+    const outcomeAtaContext =
+      isPipelineStageError(e) && e.stage === "FAILED_AT_OUTCOME_ATA"
+        ? e.outcomeAtaContext
+        : undefined;
 
     await markStatus(marketId, "failed");
     return {
@@ -555,6 +813,163 @@ export async function createMarketPipeline(
       error: errorMessage,
       stage,
       missingProgramId: missingProgramId ?? undefined,
+      outcomeAtaContext,
+    };
+  }
+}
+
+export type CompletePmammDepositInput = {
+  slug: string;
+  creatorWallet: string;
+  depositSignature: string;
+};
+
+/**
+ * After the creator signs and submits `deposit_liquidity`, persist `live` + seed tx and chart data.
+ */
+export async function completePmammUserDepositPipeline(
+  input: CompletePmammDepositInput,
+): Promise<CreateMarketResult> {
+  const sb = getSupabaseAdmin();
+  if (!sb) {
+    return {
+      ok: false,
+      error: "Supabase is not configured (SUPABASE_URL / SERVICE_ROLE_KEY).",
+    };
+  }
+
+  let creator: PublicKey;
+  try {
+    creator = new PublicKey(input.creatorWallet.trim());
+  } catch {
+    return { ok: false, error: "Invalid creator wallet address." };
+  }
+
+  const slug = input.slug.trim();
+  const depositSignature = input.depositSignature.trim();
+  if (!slug || !depositSignature) {
+    return { ok: false, error: "Missing slug or deposit signature." };
+  }
+
+  const { data: row, error: fetchErr } = await sb
+    .from("markets")
+    .select("*")
+    .eq("slug", slug)
+    .maybeSingle();
+
+  if (fetchErr || !row) {
+    return { ok: false, error: "Market not found." };
+  }
+
+  const rec = row as MarketRecord;
+  if (rec.market_engine !== "PM_AMM") {
+    return { ok: false, error: "This market is not a pmAMM market." };
+  }
+  if (rec.creator_wallet.trim() !== creator.toBase58()) {
+    return {
+      ok: false,
+      error: "Connected wallet must match the market creator.",
+    };
+  }
+  if (!rec.pool_address || !rec.yes_mint || !rec.no_mint) {
+    return { ok: false, error: "Market is missing on-chain pool data." };
+  }
+
+  if (rec.status === "live") {
+    if (rec.seed_liquidity_tx === depositSignature) {
+      return { ok: true, market: rec };
+    }
+    return { ok: false, error: "Market is already live with a different deposit." };
+  }
+
+  if (rec.status !== "creating") {
+    return {
+      ok: false,
+      error: "Market is not waiting for the initial liquidity deposit.",
+    };
+  }
+
+  if (rec.seed_liquidity_tx) {
+    return {
+      ok: false,
+      error: "Initial liquidity deposit was already recorded.",
+    };
+  }
+
+  const connection = getConnection();
+  const marketPda = new PublicKey(rec.pool_address);
+  const programId = requirePmammProgramId();
+
+  try {
+    await assertPmammDepositTxFromCreator({
+      connection,
+      signature: depositSignature,
+      marketPda,
+      creator,
+      pmammProgramId: programId,
+    });
+  } catch (e) {
+    return {
+      ok: false,
+      error: formatUnknownError(e),
+      stage: "FAILED_AT_PMAMM_DEPOSIT",
+    };
+  }
+
+  try {
+    const { data: live, error: upErr } = await sb
+      .from("markets")
+      .update({
+        status: "live",
+        seed_liquidity_tx: depositSignature,
+        last_known_yes_price: 0.5,
+        last_known_no_price: 0.5,
+        last_known_volume_usd: 0,
+        last_stats_updated_at: new Date().toISOString(),
+      })
+      .eq("id", rec.id)
+      .eq("status", "creating")
+      .select()
+      .single();
+
+    if (upErr || !live) {
+      return {
+        ok: false,
+        error:
+          upErr?.message ??
+          "Could not finalize market. It may have been updated already — refresh and try again.",
+        stage: "FAILED_AT_SUPABASE_FINAL",
+      };
+    }
+
+    const liveRow = live as MarketRecord;
+    console.info(`${LP} pmAMM user deposit confirmed`, {
+      slug: liveRow.slug,
+      depositSignature,
+      creator: creator.toBase58(),
+      pool: rec.pool_address,
+    });
+
+    try {
+      const repair = await seedMarketPriceHistoryIfEmpty(liveRow.slug);
+      if (repair.ok && repair.seeded) {
+        console.info(`${LP} pmAMM chart history seeded`, repair);
+      } else if (!repair.ok) {
+        console.warn(`${LP} pmAMM chart seed failed`, repair.error);
+      }
+    } catch (e) {
+      console.warn(
+        `${LP} pmAMM chart seed exception`,
+        formatUnknownError(e),
+      );
+    }
+
+    return { ok: true, market: liveRow };
+  } catch (e) {
+    return {
+      ok: false,
+      error: formatUnknownError(e),
+      stage: "FAILED_AT_SUPABASE_FINAL",
     };
   }
 }
