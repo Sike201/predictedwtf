@@ -12,7 +12,7 @@ import { PublicKey } from "@solana/web3.js";
 import Image from "next/image";
 import Link from "next/link";
 import { ArrowDown, ArrowUp, ArrowUpDown, BarChart3 } from "lucide-react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useWallet } from "@/lib/hooks/use-wallet";
@@ -44,6 +44,26 @@ type RowMetric = {
 };
 
 type EarnListSortKey = "liquidity" | "volume" | "apy" | "position";
+
+const LIQUIDITY_ROW_CACHE_TTL_MS = 8_000;
+const liquidityRowCache = new Map<
+  string,
+  { at: number; row: RowMetric }
+>();
+
+function getCachedLiquidityRow(slug: string): RowMetric | null {
+  const e = liquidityRowCache.get(slug);
+  if (!e) return null;
+  if (Date.now() - e.at > LIQUIDITY_ROW_CACHE_TTL_MS) {
+    liquidityRowCache.delete(slug);
+    return null;
+  }
+  return e.row;
+}
+
+function setCachedLiquidityRow(slug: string, row: RowMetric): void {
+  liquidityRowCache.set(slug, { at: Date.now(), row });
+}
 
 function fmtUsd(n: number): string {
   if (!Number.isFinite(n) || n < 0) return "—";
@@ -149,17 +169,6 @@ const earnPoolGridStyle: CSSProperties = {
     "minmax(200px, 1.55fr) minmax(92px, 0.75fr) minmax(96px, 0.8fr) minmax(88px, 0.7fr) minmax(108px, 0.85fr) minmax(240px, 1.1fr)",
 };
 
-async function chunkMap<T>(
-  items: T[],
-  size: number,
-  fn: (item: T) => Promise<void>,
-): Promise<void> {
-  for (let i = 0; i < items.length; i += size) {
-    const part = items.slice(i, i + size);
-    await Promise.all(part.map((x) => fn(x)));
-  }
-}
-
 export function EarnView({ initialMarkets }: EarnViewProps) {
   const { connection } = useConnection();
   const { publicKey } = useWallet();
@@ -167,7 +176,17 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
   const [metricsBySlug, setMetricsBySlug] = useState<
     Record<string, RowMetric | undefined>
   >({});
-  const [metricsLoading, setMetricsLoading] = useState(true);
+  /** Swap-volume / APR fetches; liquidity rows are independent. */
+  const [swapVolumeLoading, setSwapVolumeLoading] = useState(true);
+  /** Markets with failed pool/liquidity resolution (skipped in aggregation). */
+  const [failedPoolSlugs, setFailedPoolSlugs] = useState<Set<string>>(
+    () => new Set(),
+  );
+  /** `done` increases as each market finishes pool+mint fetch (incl. cache). */
+  const [liquidityLoadState, setLiquidityLoadState] = useState<{
+    done: number;
+    total: number;
+  }>({ done: 0, total: 0 });
   const [userLpBySlug, setUserLpBySlug] = useState<
     Record<string, { atoms: bigint } | undefined>
   >({});
@@ -220,12 +239,39 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
     let cancelled = false;
     if (poolMarkets.length === 0) {
       setMetricsBySlug({});
-      setMetricsLoading(false);
+      setSwapVolumeLoading(false);
+      setFailedPoolSlugs(new Set());
+      setLiquidityLoadState({ done: 0, total: 0 });
       return;
     }
 
-    setMetricsLoading(true);
-    setMetricsBySlug({});
+    setFailedPoolSlugs(new Set());
+    setSwapVolumeLoading(true);
+
+    const partial: Record<string, RowMetric> = {};
+    const fromCache: Record<string, RowMetric> = {};
+    for (const m of poolMarkets) {
+      const c = getCachedLiquidityRow(m.id);
+      if (c) {
+        fromCache[m.id] = c;
+        partial[m.id] = c;
+      }
+    }
+    const doneFromCache = Object.keys(fromCache).length;
+    if (doneFromCache > 0) {
+      setMetricsBySlug((prev) => ({ ...prev, ...fromCache }));
+    } else {
+      setMetricsBySlug((prev) => {
+        const next = { ...prev };
+        for (const m of poolMarkets) {
+          delete next[m.id];
+        }
+        return next;
+      });
+    }
+    setLiquidityLoadState({ done: doneFromCache, total: poolMarkets.length });
+
+    const needPoolFetch = poolMarkets.filter((m) => !fromCache[m.id]);
 
     void (async () => {
       let futarchyShareBps = 0;
@@ -240,92 +286,104 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
         futarchyShareBps = 0;
       }
 
-      const partial: Record<string, RowMetric> = {};
+      await Promise.all(
+        needPoolFetch.map(async (m) => {
+          if (!m.pool) return;
+          try {
+            if (cancelled) return;
+            const pair = new PublicKey(m.pool.poolId);
+            const yes = new PublicKey(m.pool.yesMint);
+            const no = new PublicKey(m.pool.noMint);
+            const state = await readOmnipairPoolState(connection, {
+              pairAddress: pair,
+              yesMint: yes,
+              noMint: no,
+            });
+            const derived = deriveMarketProbabilityFromPoolState(state);
+            const pYes =
+              derived?.yesProbability ??
+              (Number.isFinite(m.yesProbability) ? m.yesProbability : 0.5);
+            const liquidityUsd = estimatePoolLiquidityUsdHint({
+              reserveYesAtoms: state.reserveYes,
+              reserveNoAtoms: state.reserveNo,
+              yesProbability: pYes,
+            });
 
-      await chunkMap(poolMarkets, 5, async (m) => {
-        if (cancelled || !m.pool) return;
-        try {
-          const pair = new PublicKey(m.pool.poolId);
-          const yes = new PublicKey(m.pool.yesMint);
-          const no = new PublicKey(m.pool.noMint);
-          const state = await readOmnipairPoolState(connection, {
-            pairAddress: pair,
-            yesMint: yes,
-            noMint: no,
-          });
-          const derived = deriveMarketProbabilityFromPoolState(state);
-          const pYes =
-            derived?.yesProbability ??
-            (Number.isFinite(m.yesProbability) ? m.yesProbability : 0.5);
-          const liquidityUsd = estimatePoolLiquidityUsdHint({
-            reserveYesAtoms: state.reserveYes,
-            reserveNoAtoms: state.reserveNo,
-            yesProbability: pYes,
-          });
+            const lpPk = new PublicKey(state.lpMint);
+            const mint = await getMint(connection, lpPk, "confirmed");
+            const totalLp = mint.supply;
 
-          const lpPk = new PublicKey(state.lpMint);
-          const mint = await getMint(connection, lpPk, "confirmed");
-          const totalLp = mint.supply;
-
-          if (cancelled) return;
-          partial[m.id] = {
-            liquidityUsd,
-            swapFeeBps: state.swapFeeBps,
-            lpMint: state.lpMint,
-            totalLp,
-            vol24hUsd: null,
-            apr: null,
-          };
-        } catch {
-          if (!cancelled) delete partial[m.id];
-        }
-      });
-
-      if (cancelled) return;
-      setMetricsBySlug((prev) => ({ ...prev, ...partial }));
-
-      await chunkMap(poolMarkets, 6, async (m) => {
-        if (cancelled || !m.pool) return;
-        const row = partial[m.id];
-        if (!row) return;
-        try {
-          const qs = new URLSearchParams({
-            poolId: m.pool.poolId,
-            yesMint: m.pool.yesMint,
-            noMint: m.pool.noMint,
-            window: "24h",
-          });
-          const res = await fetch(`/api/market/swap-volume?${qs.toString()}`);
-          const j = (await res.json().catch(() => ({}))) as {
-            volumeUsd?: number;
-          };
-          const vol24hUsd =
-            typeof j.volumeUsd === "number" && Number.isFinite(j.volumeUsd)
-              ? Math.max(0, j.volumeUsd)
-              : 0;
-
-          const apr = estimateFeeAprFromVolume({
-            volume24hUsd: vol24hUsd,
-            liquidityUsd: row.liquidityUsd,
-            swapFeeBps: row.swapFeeBps,
-            futarchySwapShareBps: futarchyShareBps,
-          });
-
-          if (cancelled) return;
-          partial[m.id] = {
-            ...row,
-            vol24hUsd,
-            apr,
-          };
-        } catch {
-          if (cancelled) return;
-          partial[m.id] = { ...row, vol24hUsd: 0, apr: null };
-        }
-      });
+            if (cancelled) return;
+            const row: RowMetric = {
+              liquidityUsd,
+              swapFeeBps: state.swapFeeBps,
+              lpMint: state.lpMint,
+              totalLp,
+              vol24hUsd: null,
+              apr: null,
+            };
+            partial[m.id] = row;
+            setCachedLiquidityRow(m.id, row);
+            setMetricsBySlug((prev) => ({ ...prev, [m.id]: row }));
+          } catch {
+            if (cancelled) return;
+            setFailedPoolSlugs((s) => new Set(s).add(m.id));
+          } finally {
+            if (cancelled) return;
+            setLiquidityLoadState((ls) => ({
+              ...ls,
+              done: Math.min(ls.total, ls.done + 1),
+            }));
+          }
+        }),
+      );
 
       if (cancelled) return;
-      setMetricsBySlug({ ...partial });
-      setMetricsLoading(false);
+
+      await Promise.all(
+        poolMarkets.map(async (m) => {
+          if (cancelled || !m.pool) return;
+          const base = partial[m.id];
+          if (!base) return;
+          try {
+            const qs = new URLSearchParams({
+              poolId: m.pool.poolId,
+              yesMint: m.pool.yesMint,
+              noMint: m.pool.noMint,
+              window: "24h",
+            });
+            const res = await fetch(`/api/market/swap-volume?${qs.toString()}`);
+            const j = (await res.json().catch(() => ({}))) as {
+              volumeUsd?: number;
+            };
+            const vol24hUsd =
+              typeof j.volumeUsd === "number" && Number.isFinite(j.volumeUsd)
+                ? Math.max(0, j.volumeUsd)
+                : 0;
+
+            const apr = estimateFeeAprFromVolume({
+              volume24hUsd: vol24hUsd,
+              liquidityUsd: base.liquidityUsd,
+              swapFeeBps: base.swapFeeBps,
+              futarchySwapShareBps: futarchyShareBps,
+            });
+
+            if (cancelled) return;
+            const next: RowMetric = { ...base, vol24hUsd, apr };
+            partial[m.id] = next;
+            setCachedLiquidityRow(m.id, next);
+            setMetricsBySlug((prev) => ({ ...prev, [m.id]: next }));
+          } catch {
+            if (cancelled) return;
+            const next: RowMetric = { ...base, vol24hUsd: 0, apr: null };
+            partial[m.id] = next;
+            setMetricsBySlug((prev) => ({ ...prev, [m.id]: next }));
+          }
+        }),
+      );
+
+      if (cancelled) return;
+      setSwapVolumeLoading(false);
     })();
 
     return () => {
@@ -484,6 +542,48 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
     return s;
   }, [poolMarkets, metricsBySlug]);
 
+  const totalLiquidityLoadPending = useMemo(
+    () =>
+      poolMarkets.length > 0 &&
+      liquidityLoadState.done < liquidityLoadState.total,
+    [poolMarkets.length, liquidityLoadState.done, liquidityLoadState.total],
+  );
+
+  const totalHasNoProgressYet = useMemo(
+    () => poolMarkets.length > 0 && liquidityLoadState.done === 0,
+    [poolMarkets.length, liquidityLoadState.done],
+  );
+
+  const totalLiquidityStatNode: ReactNode = useMemo(() => {
+    if (poolMarkets.length === 0) {
+      return "—";
+    }
+    return (
+      <span className="inline-flex max-w-full flex-col items-end gap-0.5 sm:items-end">
+        <span
+          className={cn(
+            "inline-block",
+            totalLiquidityLoadPending && "animate-pulse",
+          )}
+        >
+          {totalHasNoProgressYet
+            ? fmtUsd(0)
+            : fmtUsd(totalLiquidityUsd)}
+        </span>
+        {totalLiquidityLoadPending ? (
+          <span className="text-[10px] font-medium leading-tight text-zinc-500">
+            Updating…
+          </span>
+        ) : null}
+      </span>
+    );
+  }, [
+    poolMarkets.length,
+    totalHasNoProgressYet,
+    totalLiquidityLoadPending,
+    totalLiquidityUsd,
+  ]);
+
   const yourPositionCount = useMemo(() => {
     let n = 0;
     for (const m of poolMarkets) {
@@ -493,10 +593,13 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
     return n;
   }, [poolMarkets, userLpBySlug]);
 
-  const statItems = [
+  const statItems: {
+    label: string;
+    value: ReactNode;
+  }[] = [
     {
       label: "Total Liquidity Provided",
-      value: metricsLoading ? "…" : fmtUsd(totalLiquidityUsd),
+      value: totalLiquidityStatNode,
     },
     {
       label: "Total Fees Earned",
@@ -510,7 +613,7 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
       label: "Your Positions",
       value: !publicKey ? "—" : lpLoading ? "…" : String(yourPositionCount),
     },
-  ] as const;
+  ];
 
   return (
     <div className={feedShell}>
@@ -613,6 +716,7 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
 
                 {displayPoolMarkets.map((m) => {
                   const met = metricsBySlug[m.id];
+                  const poolRowFailed = failedPoolSlugs.has(m.id);
                   const vol =
                     typeof m.snapshot?.volumeUsd === "number" &&
                     Number.isFinite(m.snapshot.volumeUsd)
@@ -630,7 +734,7 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
                   const posUsd = positionValueUsd(m);
 
                   const apyCell =
-                    met?.apr != null ? (
+                    met != null && met.apr != null && Number.isFinite(met.apr) ? (
                       <span
                         className={cn(
                           earnApyPill,
@@ -643,7 +747,11 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
                           aria-hidden
                         />
                       </span>
-                    ) : metricsLoading && !met ? (
+                    ) : !met && !poolRowFailed ? (
+                      <span className="text-zinc-500">…</span>
+                    ) : !met && poolRowFailed ? (
+                      <span className="text-zinc-600">—</span>
+                    ) : swapVolumeLoading ? (
                       <span className="text-zinc-500">…</span>
                     ) : (
                       <span className="text-zinc-600">—</span>
@@ -651,16 +759,20 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
 
                   const liquidityCell = (
                     <span className="inline-flex items-center justify-end gap-1 text-[12px] font-semibold tabular-nums text-white">
-                      {metricsLoading && !met ? (
+                      {met == null && !poolRowFailed ? (
                         <span className="text-zinc-500">…</span>
-                      ) : (
+                      ) : met == null && poolRowFailed ? (
+                        <span className="font-medium text-zinc-600">—</span>
+                      ) : met != null ? (
                         <>
-                          {fmtUsd(met?.liquidityUsd ?? 0)}
+                          {fmtUsd(met.liquidityUsd)}
                           <BarChart3
                             className="h-3 w-3 shrink-0 text-emerald-400/90"
                             aria-hidden
                           />
                         </>
+                      ) : (
+                        <span className="text-zinc-500">…</span>
                       )}
                     </span>
                   );
@@ -720,7 +832,7 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
                                 <span className="rounded bg-white/[0.07] px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-zinc-400">
                                   {(met.swapFeeBps / 100).toFixed(2)}% fee
                                 </span>
-                              ) : metricsLoading ? (
+                              ) : !poolRowFailed ? (
                                 <span className="text-[10px] text-zinc-600">
                                   …
                                 </span>
@@ -809,7 +921,7 @@ export function EarnView({ initialMarkets }: EarnViewProps) {
                                     <span className="rounded bg-white/[0.07] px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-zinc-400">
                                       {(met.swapFeeBps / 100).toFixed(2)}% fee
                                     </span>
-                                  ) : metricsLoading ? (
+                                  ) : !poolRowFailed ? (
                                     <span className="text-[10px] text-zinc-600">
                                       …
                                     </span>
