@@ -2,6 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useState } from "react";
 import { Plus, Search } from "lucide-react";
 import { motion } from "framer-motion";
@@ -10,13 +11,21 @@ import { HowItWorksModal } from "@/components/layout/how-it-works-modal";
 import { WalletConnectButton } from "@/components/wallet/wallet-connect-button";
 import { WalletStatus } from "@/components/wallet/wallet-status";
 import { useWallet } from "@/lib/hooks/use-wallet";
+import { useMarketNavSearch } from "@/components/providers/market-nav-search-provider";
 
 type TopNavProps = {
   className?: string;
 };
 
+const navSearchWell =
+  "trade-field-well group/nav-search relative flex min-w-0 flex-1 max-w-md items-center gap-2.5 py-2 pl-3.5 pr-3.5 lg:max-w-lg";
+
 export function TopNav({ className }: TopNavProps) {
+  const pathname = usePathname();
   const { connected } = useWallet();
+  const { query, setQuery } = useMarketNavSearch();
+  const searchPlaceholder =
+    pathname === "/earn" ? "Search pools…" : "Search markets";
   const [howOpen, setHowOpen] = useState(false);
   const [createExpanded, setCreateExpanded] = useState(false);
 
@@ -46,6 +55,17 @@ export function TopNav({ className }: TopNavProps) {
           </div>
 
           <div className="flex min-w-0 items-center justify-center gap-3 px-1 sm:gap-4">
+            <Link
+              href="/earn"
+              className={cn(
+                "inline-flex h-8 shrink-0 items-center justify-center rounded-full px-3.5 text-[12px] font-semibold tracking-tight text-zinc-100",
+                "bg-white/[0.07] ring-1 ring-inset ring-white/[0.08]",
+                "transition-colors hover:bg-white/[0.12] hover:text-white hover:ring-white/[0.12]",
+                "active:bg-white/[0.14] sm:px-4 sm:text-[13px]",
+              )}
+            >
+              Earn
+            </Link>
             <button
               type="button"
               onClick={() => setHowOpen(true)}
@@ -53,16 +73,18 @@ export function TopNav({ className }: TopNavProps) {
             >
               How it works
             </button>
-            <label className="trade-field group/nav-search relative flex min-h-[46px] min-w-0 flex-1 max-w-md items-center gap-2.5 pl-3.5 pr-4 py-2 ring-1 ring-white/[0.06] lg:max-w-lg">
-              <span className="sr-only">Search</span>
+            <label className={navSearchWell}>
+              <span className="sr-only">Search markets</span>
               <Search
-                className="h-[18px] w-[18px] shrink-0 text-zinc-500 transition-colors group-focus-within/nav-search:text-zinc-400"
+                className="h-4 w-4 shrink-0 text-zinc-500 transition-colors group-focus-within/nav-search:text-zinc-400"
                 strokeWidth={2}
                 aria-hidden
               />
               <input
                 type="search"
-                placeholder="Search markets"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder={searchPlaceholder}
                 autoComplete="off"
                 className="min-w-0 flex-1 border-0 bg-transparent py-0.5 text-[13px] font-normal text-zinc-100 placeholder:text-zinc-600 outline-none ring-0 focus:ring-0"
               />

@@ -21,6 +21,54 @@ export type OnchainPoolActivityEntry = {
 
 const SWAP_D = anchorDiscriminator("swap");
 const INIT_D = anchorDiscriminator("initialize");
+const ADD_LIQUIDITY_D = anchorDiscriminator("add_liquidity");
+const REMOVE_LIQUIDITY_D = anchorDiscriminator("remove_liquidity");
+
+type OmnipairCoreIxFlags = {
+  sawSwap: boolean;
+  sawAddLiquidity: boolean;
+  sawRemoveLiquidity: boolean;
+};
+
+/** Scan top-level + inner Omnipair instructions for swap vs liquidity adjust. */
+function scanOmnipairCoreInstructionFlags(
+  tx: ParsedTransactionWithMeta,
+  omnipairId: PublicKey,
+): OmnipairCoreIxFlags {
+  const rawIxs = collectRawInstructions(tx);
+  const flags: OmnipairCoreIxFlags = {
+    sawSwap: false,
+    sawAddLiquidity: false,
+    sawRemoveLiquidity: false,
+  };
+  for (const ix of rawIxs) {
+    if (!ix.programId.equals(omnipairId)) continue;
+    const payload = decodeSwapPayload(ix.data);
+    if (!payload || payload.length < 8) continue;
+    const head = payload.subarray(0, 8);
+    if (head.equals(SWAP_D)) flags.sawSwap = true;
+    if (head.equals(ADD_LIQUIDITY_D)) flags.sawAddLiquidity = true;
+    if (head.equals(REMOVE_LIQUIDITY_D)) flags.sawRemoveLiquidity = true;
+  }
+  return flags;
+}
+
+function liquidityAdjustWithoutSwap(flags: OmnipairCoreIxFlags): boolean {
+  const sawLiquidity = flags.sawAddLiquidity || flags.sawRemoveLiquidity;
+  return sawLiquidity && !flags.sawSwap;
+}
+
+function classifyLiquidityOnlyActivity(
+  flags: OmnipairCoreIxFlags,
+): { label: string; summary: string } {
+  if (flags.sawAddLiquidity && flags.sawRemoveLiquidity) {
+    return { label: "Liquidity", summary: "—" };
+  }
+  if (flags.sawAddLiquidity) {
+    return { label: "Add LP", summary: "—" };
+  }
+  return { label: "Remove LP", summary: "—" };
+}
 
 /** `buildOmnipairSwapInstruction` account order: tokenInMint = index 7, tokenOutMint = 8. */
 const OMNIPAIR_SWAP_TOKEN_IN_MINT_INDEX = 7;
@@ -278,6 +326,11 @@ export function parseTradeVolumeUsdMicrosFromTx(
   yesMint: PublicKey,
   noMint: PublicKey,
 ): ParsedTradeVolumeUsd {
+  const coreFlags = scanOmnipairCoreInstructionFlags(tx, omnipairId);
+  if (liquidityAdjustWithoutSwap(coreFlags)) {
+    return { micros: 0n, source: "liquidity_adjust_only" };
+  }
+
   const swapMicros = parseSwapUsdMicrosFromSwapIx(
     tx,
     omnipairId,
@@ -580,6 +633,81 @@ export async function fetchPoolTotalSwapVolumeUsdWithStats(
   };
 }
 
+const DEFAULT_24H_SIG_CAP = 20_000;
+
+/**
+ * Sum swap notional in USD for roughly the last 24h (by blockTime on
+ * `getSignaturesForAddress` rows). Stops early once signatures are older than the
+ * window — cheaper than a full-pair scan when the pool is active.
+ */
+export async function fetchPoolSwapVolumeUsd24hWithStats(
+  connection: Connection,
+  params: {
+    pairAddress: PublicKey;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+    maxSignatures?: number;
+  },
+): Promise<PoolTotalSwapVolumeStats> {
+  const omnipairId = getOmnipairProgramId();
+  const cap = Math.min(params.maxSignatures ?? DEFAULT_24H_SIG_CAP, 50_000);
+  const minBlockTimeSec = Math.floor(Date.now() / 1000) - 24 * 60 * 60;
+  const pageSize = 1000;
+  let totalMicros = 0n;
+  let swapsParsed = 0;
+  let before: string | undefined;
+  let fetched = 0;
+  let done = false;
+
+  while (fetched < cap && !done) {
+    const pageLimit = Math.min(pageSize, cap - fetched);
+    const sigInfos = await connection.getSignaturesForAddress(
+      params.pairAddress,
+      { limit: pageLimit, before },
+      "confirmed",
+    );
+    if (sigInfos.length === 0) break;
+
+    const inWindow: typeof sigInfos = [];
+    for (const s of sigInfos) {
+      if (s.err) continue;
+      if (s.blockTime != null && s.blockTime < minBlockTimeSec) {
+        done = true;
+        break;
+      }
+      inWindow.push(s);
+    }
+
+    const signatures = inWindow.map((s) => s.signature);
+    const txs = await fetchParsedTxsOneByOne(connection, signatures);
+
+    for (let i = 0; i < txs.length; i++) {
+      const tx = txs[i];
+      if (!tx) continue;
+      const micros = parseSwapUsdMicrosFromTx(
+        tx,
+        omnipairId,
+        params.yesMint,
+        params.noMint,
+      );
+      if (micros > 0n) swapsParsed += 1;
+      totalMicros += micros;
+    }
+
+    fetched += sigInfos.length;
+    const lastSig = sigInfos[sigInfos.length - 1]?.signature;
+    if (!lastSig || sigInfos.length < pageLimit) break;
+    before = lastSig;
+  }
+
+  const volumeUsd = Number(totalMicros) / 1_000_000;
+  return {
+    volumeUsd: Number.isFinite(volumeUsd) ? volumeUsd : 0,
+    signaturesScanned: fetched,
+    swapsParsed,
+  };
+}
+
 /**
  * @see fetchPoolTotalSwapVolumeUsdWithStats — same aggregation, number only.
  */
@@ -689,6 +817,11 @@ function classifyTx(
   yesMint: PublicKey,
   noMint: PublicKey,
 ): { label: string; summary: string } {
+  const coreFlags = scanOmnipairCoreInstructionFlags(tx, omnipairId);
+  if (liquidityAdjustWithoutSwap(coreFlags)) {
+    return classifyLiquidityOnlyActivity(coreFlags);
+  }
+
   const primary = classifyTxFromInstructionsOnly(tx, omnipairId, yesMint, noMint);
   const tryBalance =
     primary.label === "Pool" ||

@@ -10,6 +10,7 @@ import {
   createTransferInstruction,
   getAccount,
   getAssociatedTokenAddressSync,
+  getMint,
 } from "@solana/spl-token";
 import {
   ComputeBudgetProgram,
@@ -27,9 +28,12 @@ import {
   type DecodedOmnipairPair,
 } from "@/lib/solana/decode-omnipair-accounts";
 import {
-  getMintPositionsCustodyOwnerFromEnv,
   floorOutcomeAtomsToRedemptionGrid,
+  floorOutcomeToUsdcRedemptionGrid,
+  getMintPositionsCustodyOwnerFromEnv,
+  maxPairedBurnOutcomeAtomsForCustodyUsdc,
   outcomeBaseUnitsToUsdcBaseUnits,
+  pairedOutcomeAtomsToUsdcAtomsDynamic,
   parseOutcomeHumanToBaseUnits,
   usdcBaseUnitsToOutcomeBaseUnits,
 } from "@/lib/solana/mint-market-positions";
@@ -42,6 +46,23 @@ import { DEFAULT_OMNIPAIR_POOL_PARAMS } from "@/lib/solana/omnipair-params-hash"
 import { deriveOmnipairLayout, getGlobalFutarchyAuthorityPDA } from "@/lib/solana/omnipair-pda";
 import { requireOmnipairProgramId } from "@/lib/solana/omnipair-program";
 import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
+
+/** On-chain YES/NO mint decimals + USDC mint decimals for custody paired redemption. */
+export type RedemptionMintDecimals = {
+  outcome: number;
+  usdc: number;
+};
+
+export type SellOutcomeExplicitBalancesParams = {
+  outcomeBalances: { yes: bigint; no: bigint };
+  capOutcomeAtoms: bigint;
+  /** Pool state for swap quotes when the swap runs after a prior ix (e.g. remove_liquidity). */
+  pairDecodedForSwap: DecodedOmnipairPair;
+  /** When true, omit leading compute budget ix (caller prepends one for the whole tx). */
+  skipComputeBudgetInstruction?: boolean;
+  /** On-chain mint decimals; when set, paired burn ↔ USDC matches custody redemption. */
+  redemptionMintDecimals?: RedemptionMintDecimals;
+};
 
 export type SellOutcomeSide = "yes" | "no";
 
@@ -90,6 +111,25 @@ export type SellOutcomeForUsdcBuildLog = {
 
 function logSell(tag: string, payload: Record<string, unknown>) {
   console.info(`[predicted][sell-outcome-usdc] ${tag}`, JSON.stringify(payload));
+}
+
+/** Read YES/NO/USDC mint decimals for custody paired redemption (YES and NO must match). */
+export async function fetchRedemptionMintDecimals(
+  connection: Connection,
+  yesMint: PublicKey,
+  noMint: PublicKey,
+): Promise<RedemptionMintDecimals> {
+  const [yesM, noM, usdcM] = await Promise.all([
+    getMint(connection, yesMint, "confirmed"),
+    getMint(connection, noMint, "confirmed"),
+    getMint(connection, DEVNET_USDC_MINT, "confirmed"),
+  ]);
+  if (yesM.decimals !== noM.decimals) {
+    throw new Error(
+      `YES and NO mint decimals must match for paired redeem (yes=${yesM.decimals}, no=${noM.decimals}).`,
+    );
+  }
+  return { outcome: yesM.decimals, usdc: usdcM.decimals };
 }
 
 function vaultReservesForMints(
@@ -163,11 +203,38 @@ async function maybeCreateUserUsdcAtaIx(
   );
 }
 
-/** Max paired-burn outcome atoms redeemable given custody USDC (mint parity + grid). */
-function maxPairedBurnAtomsForCustody(custodyUsdcAtoms: bigint): bigint {
+function maxPairedBurnAtomsForCustodyAdjusted(
+  custodyUsdcAtoms: bigint,
+  rd: RedemptionMintDecimals | undefined,
+): bigint {
   if (custodyUsdcAtoms <= 0n) return 0n;
+  if (rd) {
+    return maxPairedBurnOutcomeAtomsForCustodyUsdc(
+      custodyUsdcAtoms,
+      rd.outcome,
+      rd.usdc,
+    );
+  }
   const atoms = usdcBaseUnitsToOutcomeBaseUnits(custodyUsdcAtoms);
   return floorOutcomeAtomsToRedemptionGrid(atoms);
+}
+
+function floorRedemptionGrid(
+  atoms: bigint,
+  rd: RedemptionMintDecimals | undefined,
+): bigint {
+  return rd
+    ? floorOutcomeToUsdcRedemptionGrid(atoms, rd.outcome, rd.usdc)
+    : floorOutcomeAtomsToRedemptionGrid(atoms);
+}
+
+function pairedOutcomeToUsdcAdjusted(
+  atoms: bigint,
+  rd: RedemptionMintDecimals | undefined,
+): bigint {
+  return rd
+    ? pairedOutcomeAtomsToUsdcAtomsDynamic(atoms, rd.outcome, rd.usdc)
+    : outcomeBaseUnitsToUsdcBaseUnits(atoms);
 }
 
 const SEARCH_STEPS = 96n;
@@ -186,6 +253,7 @@ function bestSwapInSellYes(params: {
   futarchySwapShareBps: number;
   yesMint: PublicKey;
   slippageBps: number;
+  floorRedeemGrid: (atoms: bigint) => bigint;
 }): bigint {
   const hi =
     params.cap < params.yes0
@@ -209,7 +277,7 @@ function bestSwapInSellYes(params: {
     const no1 = params.no0 + minOut;
     let raw = yes1 < no1 ? yes1 : no1;
     raw = min3(raw, budget, params.maxPairByCustody);
-    return floorOutcomeAtomsToRedemptionGrid(raw);
+    return params.floorRedeemGrid(raw);
   };
 
   let bestS = 0n;
@@ -245,6 +313,7 @@ function bestSwapInSellNo(params: {
   futarchySwapShareBps: number;
   noMint: PublicKey;
   slippageBps: number;
+  floorRedeemGrid: (atoms: bigint) => bigint;
 }): bigint {
   const hi = params.cap < params.no0 ? params.cap : params.no0;
   if (hi <= 0n) return 0n;
@@ -265,7 +334,7 @@ function bestSwapInSellNo(params: {
     const yes1 = params.yes0 + minOut;
     let raw = yes1 < no1 ? yes1 : no1;
     raw = min3(raw, budget, params.maxPairByCustody);
-    return floorOutcomeAtomsToRedemptionGrid(raw);
+    return params.floorRedeemGrid(raw);
   };
 
   let bestS = 0n;
@@ -366,6 +435,7 @@ export async function planSellOutcomeForUsdc(
 type ComputeCoreResult = {
   log: SellOutcomeForUsdcBuildLog;
   serialized?: Uint8Array;
+  instructions?: TransactionInstruction[];
   recentBlockhash: string;
   lastValidBlockHeight: number;
 };
@@ -381,8 +451,12 @@ async function computeSellOutcomeCore(params: {
   outcomeAmountHuman: string;
   marketSlug?: string;
   slippageBps?: number;
-}): Promise<ComputeCoreResult> {
+  /** Return redeem instructions only (for composing with remove_liquidity in one tx). */
+  composeOnly?: boolean;
+} & Partial<SellOutcomeExplicitBalancesParams>): Promise<ComputeCoreResult> {
   const slippageBps = params.slippageBps ?? 100;
+  const rd = params.redemptionMintDecimals;
+  const floorFn = (a: bigint) => floorRedemptionGrid(a, rd);
   const programId = requireOmnipairProgramId();
 
   const layout = deriveOmnipairLayout(
@@ -423,18 +497,33 @@ async function computeSellOutcomeCore(params: {
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
 
-  let yes0 = await readOutcomeBal(params.connection, userYesAta);
-  let no0 = await readOutcomeBal(params.connection, userNoAta);
-
-  const requested = parseOutcomeHumanToBaseUnits(params.outcomeAmountHuman.trim());
-  if (requested <= 0n) {
-    throw new Error("Enter a position size greater than zero to sell.");
+  let yes0: bigint;
+  let no0: bigint;
+  if (params.outcomeBalances) {
+    yes0 = params.outcomeBalances.yes;
+    no0 = params.outcomeBalances.no;
+  } else {
+    yes0 = await readOutcomeBal(params.connection, userYesAta);
+    no0 = await readOutcomeBal(params.connection, userNoAta);
   }
 
-  const cap =
-    params.side === "yes"
-      ? (requested > yes0 ? yes0 : requested)
-      : (requested > no0 ? no0 : requested);
+  let cap: bigint;
+  if (params.capOutcomeAtoms != null) {
+    const want = params.capOutcomeAtoms;
+    cap =
+      params.side === "yes"
+        ? (want > yes0 ? yes0 : want)
+        : (want > no0 ? no0 : want);
+  } else {
+    const requested = parseOutcomeHumanToBaseUnits(params.outcomeAmountHuman.trim());
+    if (requested <= 0n) {
+      throw new Error("Enter a position size greater than zero to sell.");
+    }
+    cap =
+      params.side === "yes"
+        ? (requested > yes0 ? yes0 : requested)
+        : (requested > no0 ? no0 : requested);
+  }
 
   if (cap <= 0n) {
     throw new Error("Insufficient outcome token balance to sell.");
@@ -445,9 +534,10 @@ async function computeSellOutcomeCore(params: {
     "confirmed",
   );
   if (!pairInfo?.data) throw new Error("Omnipair pair account missing");
-  const pairDecoded = decodeOmnipairPairAccount(pairInfo.data);
+  const pairDecodedFresh = decodeOmnipairPairAccount(pairInfo.data);
+  const pairForSwapMath = params.pairDecodedForSwap ?? pairDecodedFresh;
   const { reserveYes, reserveNo } = vaultReservesForMints(
-    pairDecoded,
+    pairForSwapMath,
     params.yesMint,
   );
 
@@ -457,12 +547,18 @@ async function computeSellOutcomeCore(params: {
   const futarchySwapShareBps = decodeFutarchySwapShareBps(futarchyInfo.data);
 
   const custodyUsdcBal = await readUsdcBal(params.connection, custodyUsdcAta);
-  const maxPairByCustody = maxPairedBurnAtomsForCustody(custodyUsdcBal);
+  const maxPairByCustody = maxPairedBurnAtomsForCustodyAdjusted(
+    custodyUsdcBal,
+    rd,
+  );
 
   logSell("pre-execution", {
     marketSlug: params.marketSlug,
     side: params.side,
-    outcomeAmountHuman: params.outcomeAmountHuman,
+    outcomeAmountHuman:
+      params.capOutcomeAtoms != null
+        ? `(explicit_cap ${params.capOutcomeAtoms.toString()})`
+        : params.outcomeAmountHuman,
     reserveYes: reserveYes.toString(),
     reserveNo: reserveNo.toString(),
     yes0: yes0.toString(),
@@ -481,18 +577,19 @@ async function computeSellOutcomeCore(params: {
       no0,
       cap,
       maxPairByCustody,
-      pairDecoded,
+      pairDecoded: pairForSwapMath,
       futarchySwapShareBps,
       yesMint: params.yesMint,
       slippageBps,
+      floorRedeemGrid: floorFn,
     });
     if (swapIn > 0n) {
       const minOut = applySlippageFloor(
         estimateOmnipairSwapAmountOut({
-          pair: pairDecoded,
+          pair: pairForSwapMath,
           futarchySwapShareBps,
           amountIn: swapIn,
-          isToken0In: params.yesMint.equals(pairDecoded.token0),
+          isToken0In: params.yesMint.equals(pairForSwapMath.token0),
         }),
         slippageBps,
       );
@@ -502,7 +599,7 @@ async function computeSellOutcomeCore(params: {
         swapIx = buildOmnipairSwapInstruction({
           programId,
           pair: params.pairAddress,
-          rateModel: pairDecoded.rateModel,
+          rateModel: pairDecodedFresh.rateModel,
           tokenInMint: params.yesMint,
           tokenOutMint: params.noMint,
           user: params.user,
@@ -519,18 +616,19 @@ async function computeSellOutcomeCore(params: {
       no0,
       cap,
       maxPairByCustody,
-      pairDecoded,
+      pairDecoded: pairForSwapMath,
       futarchySwapShareBps,
       noMint: params.noMint,
       slippageBps,
+      floorRedeemGrid: floorFn,
     });
     if (swapIn > 0n) {
       const minOut = applySlippageFloor(
         estimateOmnipairSwapAmountOut({
-          pair: pairDecoded,
+          pair: pairForSwapMath,
           futarchySwapShareBps,
           amountIn: swapIn,
-          isToken0In: params.noMint.equals(pairDecoded.token0),
+          isToken0In: params.noMint.equals(pairForSwapMath.token0),
         }),
         slippageBps,
       );
@@ -540,7 +638,7 @@ async function computeSellOutcomeCore(params: {
         swapIx = buildOmnipairSwapInstruction({
           programId,
           pair: params.pairAddress,
-          rateModel: pairDecoded.rateModel,
+          rateModel: pairDecodedFresh.rateModel,
           tokenInMint: params.noMint,
           tokenOutMint: params.yesMint,
           user: params.user,
@@ -557,10 +655,10 @@ async function computeSellOutcomeCore(params: {
     swapIn > 0n && params.side === "yes"
       ? applySlippageFloor(
           estimateOmnipairSwapAmountOut({
-            pair: pairDecoded,
+            pair: pairForSwapMath,
             futarchySwapShareBps,
             amountIn: swapIn,
-            isToken0In: params.yesMint.equals(pairDecoded.token0),
+            isToken0In: params.yesMint.equals(pairForSwapMath.token0),
           }),
           slippageBps,
         )
@@ -569,10 +667,10 @@ async function computeSellOutcomeCore(params: {
     swapIn > 0n && params.side === "no"
       ? applySlippageFloor(
           estimateOmnipairSwapAmountOut({
-            pair: pairDecoded,
+            pair: pairForSwapMath,
             futarchySwapShareBps,
             amountIn: swapIn,
-            isToken0In: params.noMint.equals(pairDecoded.token0),
+            isToken0In: params.noMint.equals(pairForSwapMath.token0),
           }),
           slippageBps,
         )
@@ -602,17 +700,16 @@ async function computeSellOutcomeCore(params: {
   const pairSideMin = yes1 < no1Worst ? yes1 : no1Worst;
   const econEligible =
     pairSideMin < sellBudgetRemain ? pairSideMin : sellBudgetRemain;
-  const eligiblePairedBurnOutcomeAtomsStr =
-    floorOutcomeAtomsToRedemptionGrid(econEligible).toString();
+  const eligiblePairedBurnOutcomeAtomsStr = floorFn(econEligible).toString();
   let rawEligible =
     econEligible > maxPairByCustody ? maxPairByCustody : econEligible;
-  let pairedBurn = floorOutcomeAtomsToRedemptionGrid(rawEligible);
+  let pairedBurn = floorFn(rawEligible);
 
   let usdcOut = 0n;
   let routeKindUsdc: "full_usdc_exit" | "partial_usdc_exit" | null = null;
 
   if (pairedBurn > 0n) {
-    usdcOut = outcomeBaseUnitsToUsdcBaseUnits(pairedBurn);
+    usdcOut = pairedOutcomeToUsdcAdjusted(pairedBurn, rd);
     if (usdcOut <= 0n) {
       pairedBurn = 0n;
     }
@@ -647,13 +744,13 @@ async function computeSellOutcomeCore(params: {
     }
     fallbackSwapIn = hi;
     const estOut = estimateOmnipairSwapAmountOut({
-      pair: pairDecoded,
+      pair: pairForSwapMath,
       futarchySwapShareBps,
       amountIn: fallbackSwapIn,
       isToken0In:
         params.side === "yes"
-          ? params.yesMint.equals(pairDecoded.token0)
-          : params.noMint.equals(pairDecoded.token0),
+          ? params.yesMint.equals(pairForSwapMath.token0)
+          : params.noMint.equals(pairForSwapMath.token0),
     });
     fallbackMinOut = applySlippageFloor(estOut, slippageBps);
     if (fallbackMinOut <= 0n) {
@@ -665,7 +762,7 @@ async function computeSellOutcomeCore(params: {
       fallbackIx = buildOmnipairSwapInstruction({
         programId,
         pair: params.pairAddress,
-        rateModel: pairDecoded.rateModel,
+        rateModel: pairDecodedFresh.rateModel,
         tokenInMint: params.yesMint,
         tokenOutMint: params.noMint,
         user: params.user,
@@ -678,7 +775,7 @@ async function computeSellOutcomeCore(params: {
       fallbackIx = buildOmnipairSwapInstruction({
         programId,
         pair: params.pairAddress,
-        rateModel: pairDecoded.rateModel,
+        rateModel: pairDecodedFresh.rateModel,
         tokenInMint: params.noMint,
         tokenOutMint: params.yesMint,
         user: params.user,
@@ -730,7 +827,9 @@ async function computeSellOutcomeCore(params: {
 
   const microLamports = Math.floor(Math.random() * 900_000) + 1;
   const ixs: TransactionInstruction[] = [];
-  ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports }));
+  if (!params.skipComputeBudgetInstruction) {
+    ixs.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports }));
+  }
 
   const ixUserUsdc = await maybeCreateUserUsdcAtaIx(
     params.connection,
@@ -828,6 +927,19 @@ async function computeSellOutcomeCore(params: {
     };
   }
 
+  if (params.composeOnly) {
+    const { blockhash, lastValidBlockHeight } =
+      await params.connection.getLatestBlockhash("confirmed");
+    log.recentBlockhash = blockhash;
+    log.lastValidBlockHeight = lastValidBlockHeight;
+    return {
+      log,
+      instructions: ixs,
+      recentBlockhash: blockhash,
+      lastValidBlockHeight,
+    };
+  }
+
   const tx = new Transaction();
   tx.add(...ixs);
   tx.feePayer = params.user;
@@ -881,6 +993,111 @@ export async function buildSellOutcomeForUsdcTransactionEngineSigned(params: {
   }
   return {
     serialized: result.serialized,
+    log: result.log,
+    recentBlockhash: result.recentBlockhash,
+    lastValidBlockHeight: result.lastValidBlockHeight,
+  };
+}
+
+/** Plan paired USDC redeem when outcome balances are known (e.g. after a simulated remove_liquidity). */
+export async function planSellOutcomePairedRedeemFromSnapshot(
+  params: {
+    connection: Connection;
+    user: PublicKey;
+    side: SellOutcomeSide;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+    pairAddress: PublicKey;
+    marketSlug?: string;
+    slippageBps?: number;
+  } & SellOutcomeExplicitBalancesParams,
+): Promise<SellOutcomePlan> {
+  const { log } = await computeSellOutcomeCore({
+    ...params,
+    engine: null,
+    outcomeAmountHuman: "",
+  });
+  return {
+    routeKind: log.routeKind,
+    reserveYes: log.reserveYes,
+    reserveNo: log.reserveNo,
+    requestedCapOutcomeAtoms: log.requestedCapOutcomeAtoms,
+    eligiblePairedBurnOutcomeAtoms: log.eligiblePairedBurnOutcomeAtoms,
+    pairedBurnOutcomeAtoms: log.pairedBurnOutcomeAtoms,
+    custodyUsdcAtoms: log.custodyUsdcAtoms,
+    usdcOutAtoms: log.usdcOutAtoms,
+    rebalanceSwapAmountIn: log.rebalanceSwapAmountIn,
+    leftoverYesAtoms: log.leftoverYesAtoms,
+    leftoverNoAtoms: log.leftoverNoAtoms,
+    fallbackSwapAmountIn: log.fallbackSwapAmountIn,
+    fallbackOppositeMinOut: log.fallbackOppositeMinOut,
+    uiSummary: log.uiSummary,
+    winningBurnOutcomeAtoms: log.winningBurnOutcomeAtoms,
+  };
+}
+
+export async function buildSellOutcomePairedRedeemTransactionEngineSignedFromSnapshot(
+  params: {
+    connection: Connection;
+    engine: Keypair;
+    user: PublicKey;
+    side: SellOutcomeSide;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+    pairAddress: PublicKey;
+    marketSlug?: string;
+    slippageBps?: number;
+  } & SellOutcomeExplicitBalancesParams,
+): Promise<{
+  serialized: Uint8Array;
+  log: SellOutcomeForUsdcBuildLog;
+  recentBlockhash: string;
+  lastValidBlockHeight: number;
+}> {
+  const result = await computeSellOutcomeCore({
+    ...params,
+    outcomeAmountHuman: "",
+  });
+  if (!result.serialized) {
+    throw new Error("Paired redeem builder did not produce a transaction.");
+  }
+  return {
+    serialized: result.serialized,
+    log: result.log,
+    recentBlockhash: result.recentBlockhash,
+    lastValidBlockHeight: result.lastValidBlockHeight,
+  };
+}
+
+/** Redeem leg ix only — compose with `remove_liquidity`, then single `partialSign(engine)`. */
+export async function buildSellOutcomePairedRedeemInstructionsFromSnapshot(
+  params: {
+    connection: Connection;
+    engine: Keypair;
+    user: PublicKey;
+    side: SellOutcomeSide;
+    yesMint: PublicKey;
+    noMint: PublicKey;
+    pairAddress: PublicKey;
+    marketSlug?: string;
+    slippageBps?: number;
+  } & SellOutcomeExplicitBalancesParams,
+): Promise<{
+  instructions: TransactionInstruction[];
+  log: SellOutcomeForUsdcBuildLog;
+  recentBlockhash: string;
+  lastValidBlockHeight: number;
+}> {
+  const result = await computeSellOutcomeCore({
+    ...params,
+    outcomeAmountHuman: "",
+    composeOnly: true,
+  });
+  if (!result.instructions?.length) {
+    throw new Error("Paired redeem instruction builder failed.");
+  }
+  return {
+    instructions: result.instructions,
     log: result.log,
     recentBlockhash: result.recentBlockhash,
     lastValidBlockHeight: result.lastValidBlockHeight,

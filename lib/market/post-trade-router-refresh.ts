@@ -1,5 +1,7 @@
 "use client";
 
+import { clearSolanaRpcReadCache } from "@/lib/solana/connection-resilient";
+
 const POST_TRADE_SAFETY_REFRESH_MS = 1500;
 
 export type PostTradeRouter = {
@@ -33,6 +35,7 @@ export async function runPostTradeRefreshSequence(
     delayMs: 0,
     afterAwaitedVolumeUpdate,
   });
+  clearSolanaRpcReadCache();
   await Promise.resolve(router.refresh());
 
   setTimeout(() => {
@@ -43,6 +46,7 @@ export async function runPostTradeRefreshSequence(
       delayMs: POST_TRADE_SAFETY_REFRESH_MS,
       afterAwaitedVolumeUpdate,
     });
+    clearSolanaRpcReadCache();
     void router.refresh();
   }, POST_TRADE_SAFETY_REFRESH_MS);
 }

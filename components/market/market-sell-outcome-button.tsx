@@ -21,6 +21,11 @@ type MarketSellOutcomeButtonProps = {
   sellSide: SellOutcomeSide;
   outcomeAmountHuman: string;
   sellLabel: string;
+  feedbackMode?: "inline" | "none";
+  onTxError?: (error: unknown) => void;
+  actionLocked?: boolean;
+  pendingLabel?: string;
+  onInFlightChange?: (inFlight: boolean) => void;
   /** When the market is resolved, logs `redeem_attempt` for MVP analytics. */
   forResolutionRedeem?: boolean;
   onTradeSuccess?: (args: {
@@ -66,7 +71,12 @@ export function MarketSellOutcomeButton({
   sellSide,
   outcomeAmountHuman,
   sellLabel,
+  feedbackMode = "inline",
+  onTxError,
+  actionLocked = false,
+  pendingLabel = "Confirming...",
   forResolutionRedeem,
+  onInFlightChange,
   onTradeSuccess,
 }: MarketSellOutcomeButtonProps) {
   const router = useRouter();
@@ -107,12 +117,14 @@ export function MarketSellOutcomeButton({
 
     inFlightRef.current = true;
     setSubmitting(true);
+    onInFlightChange?.(true);
     setFeedback(null);
 
     if (market.kind !== "binary") {
       setFeedback("Sells are enabled for binary YES/NO markets only.");
       inFlightRef.current = false;
       setSubmitting(false);
+      onInFlightChange?.(false);
       return;
     }
 
@@ -224,17 +236,23 @@ export function MarketSellOutcomeButton({
         setFeedback(null);
       }
     } catch (e) {
-      const friendly = formatSellError(e);
-      setFeedback(friendly);
-      if (
-        typeof friendly === "string" &&
-        friendly.includes("already submitted")
-      ) {
-        router.refresh();
+      console.error("[predicted][sell-outcome-usdc] client: catch", e);
+      if (feedbackMode === "none") {
+        onTxError?.(e);
+      } else {
+        const friendly = formatSellError(e);
+        setFeedback(friendly);
+        if (
+          typeof friendly === "string" &&
+          friendly.includes("already submitted")
+        ) {
+          router.refresh();
+        }
       }
     } finally {
       inFlightRef.current = false;
       setSubmitting(false);
+      onInFlightChange?.(false);
     }
   }, [
     connect,
@@ -242,13 +260,16 @@ export function MarketSellOutcomeButton({
     connection,
     forResolutionRedeem,
     market,
+    onInFlightChange,
     onTradeSuccess,
+    onTxError,
     outcomeAmountHuman,
     publicKey,
     router,
     sellSide,
     setVisible,
     signTransaction,
+    feedbackMode,
     wallet,
   ]);
 
@@ -261,6 +282,7 @@ export function MarketSellOutcomeButton({
   const parsed =
     Number.parseFloat(outcomeAmountHuman.replace(/[^0-9.]/g, "")) || 0;
   const canSubmit =
+    !actionLocked &&
     connected &&
     !!publicKey &&
     !!signTransaction &&
@@ -273,15 +295,15 @@ export function MarketSellOutcomeButton({
       <button
         type="button"
         onClick={onClick}
-        disabled={connected ? !canSubmit : connecting}
+        disabled={actionLocked || (connected ? !canSubmit : connecting)}
         className={cn(
           "relative z-10 w-full rounded-full bg-white/[0.08] py-3 text-[13px] font-semibold text-zinc-100 ring-1 ring-white/[0.1] transition hover:bg-white/[0.12] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50",
           className,
         )}
       >
-        {connected && submitting ? "Processing…" : label}
+        {connected && submitting ? pendingLabel : label}
       </button>
-      {feedback ? (
+      {feedbackMode !== "none" && feedback ? (
         <p
           className="text-center text-[11px] leading-snug text-zinc-500"
           role="status"

@@ -29,7 +29,7 @@ import { useOmnipairUserPosition } from "@/lib/hooks/use-omnipair-user-position"
 import { useWallet } from "@/lib/hooks/use-wallet";
 import { OUTCOME_MINT_DECIMALS } from "@/lib/solana/create-outcome-mints";
 import { MarketDetailHeader } from "@/components/market/market-detail-header";
-import { TradingPanel } from "@/components/market/trading-panel";
+import { MarketActionsCard } from "@/components/market/market-actions-card";
 import { DateTradingPanel } from "@/components/market/date-trading-panel";
 import { RaisingPanel } from "@/components/market/raising-panel";
 import { MarketResolverPanel } from "@/components/market/market-resolver-panel";
@@ -88,7 +88,7 @@ export function MarketDetailView({
   useEffect(() => {
     const id = window.setInterval(() => {
       setTimeTick((n) => n + 1);
-    }, 15_000);
+    }, 25_000);
     return () => window.clearInterval(id);
   }, []);
   const tr = useMemo(
@@ -416,6 +416,14 @@ export function MarketDetailView({
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.48, ease: [0.16, 1, 0.3, 1] }}
         >
+          {livePool.rpcDegradedMessage ? (
+            <div
+              className="mb-3 rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[13px] text-amber-100/95"
+              role="status"
+            >
+              {livePool.rpcDegradedMessage}
+            </div>
+          ) : null}
           <MarketDetailHeader
             market={displayMarket}
             liveYesProbability={
@@ -531,33 +539,24 @@ export function MarketDetailView({
                 (displayMarket.phase === "trading" || displayMarket.phase === "resolving") ? (
                   <MarketResolverPanel market={displayMarket} />
                 ) : null}
-                <TradingPanel
+                <MarketActionsCard
                   market={displayMarket}
+                  variant="market"
+                  initialActionTab="buy"
+                  poolPriceLoading={livePool.loading}
                   {...(showPositionPanel && displayMarket.pool
                     ? {
-                        liveYesProbability:
-                          tradingOpen || isResolved
-                            ? livePool.yesProbability
-                            : undefined,
-                        liveNoProbability:
-                          tradingOpen || isResolved
-                            ? livePool.noProbability
-                            : undefined,
-                        livePriceUnavailable:
-                          tradingOpen || isResolved
-                            ? livePool.unavailable
-                            : true,
-                        oneSidedLiquidity:
-                          tradingOpen || isResolved
-                            ? livePool.oneSidedLiquidity
-                            : false,
+                        liveYesProbability: livePool.yesProbability ?? undefined,
+                        liveNoProbability: livePool.noProbability ?? undefined,
+                        livePriceUnavailable: livePool.unavailable,
+                        oneSidedLiquidity: livePool.oneSidedLiquidity,
                         onPoolTxSettled,
                         onOmnipairRefresh: omnipairHook.refresh,
                         onTradePriceSnapshot,
-                        omnipairSnapshot: omnipairHook.snapshot,
                         onLeverageAfterTx: isResolved
                           ? undefined
                           : onLeverageAfterTx,
+                        omnipairSnapshot: omnipairHook.snapshot,
                       }
                     : {})}
                 />

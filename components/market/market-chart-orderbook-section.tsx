@@ -20,6 +20,7 @@ const CHART_SERIES_LOG = "[predicted][chart-series]";
 const CHART_TIME_PLACEMENT_LOG = "[predicted][chart-time-placement]";
 const CHART_HYDRATE = "[predicted][chart-hydrate]";
 const RESOLVED_CHART_CLAMP_LOG = "[predicted][resolved-chart-clamp]";
+const CHART_FLAT_FALLBACK_LOG = "[predicted][chart-flat-fallback]";
 
 type MainTab = "chart" | "orderbook";
 
@@ -297,10 +298,22 @@ export function MarketChartOrderbookSection({
     createdAtMs,
   ]);
 
-  const notEnoughRecentTrades =
-    range !== "ALL" &&
-    inWindowHistory.length === 0 &&
-    anchorPoint == null;
+  /** Distinct persisted knots (anchor + in-window) used before live tail — not counting live tail. */
+  const pathInputKnotCount = useMemo(() => {
+    if (range === "ALL") {
+      return normalizedHistory.length;
+    }
+    if (inWindowHistory.length === 0 && anchorPoint == null) return 0;
+    let c = inWindowHistory.length;
+    if (anchorPoint) {
+      if (inWindowHistory.length > 0) {
+        if (anchorPoint.t !== inWindowHistory[0]!.t) c += 1;
+      } else {
+        c += 1;
+      }
+    }
+    return c;
+  }, [range, normalizedHistory.length, inWindowHistory, anchorPoint]);
 
   const renderYesPrice =
     useLive && liveYesProbability != null ? liveYesProbability : yesP;
@@ -311,6 +324,22 @@ export function MarketChartOrderbookSection({
         : (renderYesPrice as number),
     [renderYesPrice, resolvedDisplay],
   );
+
+  const validChartEnd =
+    Number.isFinite(chartEndYesPrice) &&
+    chartEndYesPrice >= 0 &&
+    chartEndYesPrice <= 1;
+
+  /** Fewer than 2 real samples: draw a flat line at current YES probability (no implied baseline jump). */
+  const chartFlatHistoryFallback =
+    !resolvedDisplay && validChartEnd && pathInputKnotCount < 2;
+
+  const notEnoughRecentTrades =
+    range !== "ALL" &&
+    inWindowHistory.length === 0 &&
+    anchorPoint == null &&
+    !chartFlatHistoryFallback;
+
   const canAppendLiveTail =
     !resolvedDisplay &&
     Number.isFinite(renderYesPrice) &&
@@ -336,6 +365,7 @@ export function MarketChartOrderbookSection({
     }
 
     const shouldAppendLive =
+      !chartFlatHistoryFallback &&
       canAppendLiveTail &&
       (base.length > 0 ||
         (range === "ALL" && normalizedHistory.length > 0));
@@ -354,6 +384,7 @@ export function MarketChartOrderbookSection({
     return [...base, { t: tailT, p: y, _liveTail: true }];
   }, [
     anchorPoint,
+    chartFlatHistoryFallback,
     inWindowHistory,
     notEnoughRecentTrades,
     canAppendLiveTail,
@@ -377,15 +408,40 @@ export function MarketChartOrderbookSection({
     const endMs = Date.now();
     if (notEnoughRecentTrades) return null;
 
+    const pathPoints =
+      chartFlatHistoryFallback ? [] : chartHistoryPointsForPath;
+
     let startMs: number;
     if (range === "ALL") {
-      if (normalizedHistory.length === 0) return null;
+      if (normalizedHistory.length === 0) {
+        if (!chartFlatHistoryFallback || !validChartEnd) return null;
+        const startMsAll = Math.min(
+          createdAtMs ?? endMs - 86400000,
+          endMs - 60_000,
+        );
+        const pathSeries = buildPathSeriesForTimeDomain({
+          points: [],
+          startMs: startMsAll,
+          endMs,
+          endPrice: chartEndYesPrice,
+        });
+        const span = endMs - startMsAll;
+        const tickCount = xAxisTickCountForRange("ALL", span);
+        const tickTimes = evenTimeTicks(startMsAll, endMs, tickCount);
+        return {
+          pathSeries,
+          xDomain: { minT: startMsAll, maxT: endMs } as const,
+          xTickCount: tickCount,
+          tickTimes,
+          livePointTs: endMs,
+        };
+      }
       startMs = normalizedHistory[0]!.t;
       const lastData = normalizedHistory[normalizedHistory.length - 1]!.t;
       const domainEnd = Math.max(lastData, endMs);
       if (domainEnd - startMs <= 0) return null;
       const pathSeries = buildPathSeriesForTimeDomain({
-        points: chartHistoryPointsForPath,
+        points: pathPoints,
         startMs,
         endMs: domainEnd,
         endPrice: chartEndYesPrice,
@@ -409,7 +465,7 @@ export function MarketChartOrderbookSection({
       firstHistoryT: earliestHistoryPointTs,
     }).effectiveStartMs;
     const pathSeries = buildPathSeriesForTimeDomain({
-      points: chartHistoryPointsForPath,
+      points: pathPoints,
       startMs,
       endMs,
       endPrice: chartEndYesPrice,
@@ -425,6 +481,7 @@ export function MarketChartOrderbookSection({
       livePointTs: endMs,
     };
   }, [
+    chartFlatHistoryFallback,
     chartHistoryPointsForPath,
     chartEndYesPrice,
     createdAtMs,
@@ -432,9 +489,36 @@ export function MarketChartOrderbookSection({
     notEnoughRecentTrades,
     normalizedHistory,
     range,
+    validChartEnd,
     windowMsForRange,
     chartClock,
     liveRefreshEpoch,
+  ]);
+
+  const chartFlatFallbackLogKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    if (!chartFlatHistoryFallback || !chartPathPrep) return;
+    const key = `${market.id}\0${range}\0${pathInputKnotCount}\0${chartPathPrep.pathSeries.length}`;
+    if (chartFlatFallbackLogKey.current === key) return;
+    chartFlatFallbackLogKey.current = key;
+    console.info(
+      CHART_FLAT_FALLBACK_LOG,
+      "Chart fallback: insufficient history, rendering flat line.",
+      JSON.stringify({
+        slug: market.id,
+        timeframe: range,
+        pathInputKnotCount,
+        endPrice: chartEndYesPrice,
+      }),
+    );
+  }, [
+    chartEndYesPrice,
+    chartFlatHistoryFallback,
+    chartPathPrep,
+    market.id,
+    pathInputKnotCount,
+    range,
   ]);
 
   const chartSeriesLogRef = useRef<string | null>(null);
@@ -588,15 +672,21 @@ export function MarketChartOrderbookSection({
     ) {
       return Math.round(liveYesProbability * 100);
     }
+    if (chartFlatHistoryFallback && validChartEnd) {
+      return Math.round(chartEndYesPrice * 100);
+    }
     const last = chartRenderSeries[chartRenderSeries.length - 1];
     if (last) return Math.round(last.p * 100);
     return null;
   }, [
+    chartEndYesPrice,
+    chartFlatHistoryFallback,
     chartRenderSeries,
     useLive,
     liveYesProbability,
     liveNoProbability,
     liveRefreshEpoch,
+    validChartEnd,
   ]);
 
   const chartHeadlineLogRef = useRef<string | null>(null);
@@ -648,7 +738,8 @@ export function MarketChartOrderbookSection({
 
   const hasRenderableLine =
     (chartPathPrep?.pathSeries.length ?? 0) >= 2;
-  const hasRenderableChart = chartRenderSeries.length > 0;
+  const hasRenderableChart =
+    chartRenderSeries.length > 0 || chartFlatHistoryFallback;
   const showHistoryLoading =
     historyLoading && cachedSeries.length === 0;
 
@@ -671,8 +762,15 @@ export function MarketChartOrderbookSection({
 
   const chartDrawEpoch = useMemo(
     () =>
-      `${inWindowHistory.length}-${range}-${liveRefreshEpoch}-${historyLoading ? "l" : "r"}-${chartRenderSeries.length}`,
-    [inWindowHistory.length, range, liveRefreshEpoch, historyLoading, chartRenderSeries.length],
+      `${inWindowHistory.length}-${range}-${liveRefreshEpoch}-${historyLoading ? "l" : "r"}-${chartRenderSeries.length}-${chartFlatHistoryFallback ? "flat" : "n"}`,
+    [
+      chartFlatHistoryFallback,
+      chartRenderSeries.length,
+      historyLoading,
+      inWindowHistory.length,
+      liveRefreshEpoch,
+      range,
+    ],
   );
 
   const chartShell = (

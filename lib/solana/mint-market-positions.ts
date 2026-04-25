@@ -36,6 +36,61 @@ export const MINT_POSITIONS_USDC_DECIMALS = 6;
 const OUTCOME_PER_USDC_EXP =
   BigInt(OUTCOME_MINT_DECIMALS) - BigInt(MINT_POSITIONS_USDC_DECIMALS);
 
+/** `10^(outcome_dp - usdc_dp)` for paired full-set ↔ USDC custody mapping. */
+export function redemptionAtomsExponent(
+  outcomeDecimals: number,
+  usdcDecimals: number,
+): bigint {
+  if (outcomeDecimals < usdcDecimals) {
+    throw new Error(
+      "outcomeDecimals must be >= usdcDecimals for custody redemption mapping.",
+    );
+  }
+  return BigInt(outcomeDecimals - usdcDecimals);
+}
+
+export function usdcBaseUnitsToOutcomeBaseUnitsDynamic(
+  usdcAtoms: bigint,
+  outcomeDecimals: number,
+  usdcDecimals: number,
+): bigint {
+  return usdcAtoms * 10n ** redemptionAtomsExponent(outcomeDecimals, usdcDecimals);
+}
+
+/** Paired outcome atoms (same raw amount burned on YES and NO) → USDC atoms. */
+export function pairedOutcomeAtomsToUsdcAtomsDynamic(
+  outcomeAtoms: bigint,
+  outcomeDecimals: number,
+  usdcDecimals: number,
+): bigint {
+  if (outcomeAtoms <= 0n) return 0n;
+  return outcomeAtoms / 10n ** redemptionAtomsExponent(outcomeDecimals, usdcDecimals);
+}
+
+export function floorOutcomeToUsdcRedemptionGrid(
+  outcomeAtoms: bigint,
+  outcomeDecimals: number,
+  usdcDecimals: number,
+): bigint {
+  const grid = 10n ** redemptionAtomsExponent(outcomeDecimals, usdcDecimals);
+  return (outcomeAtoms / grid) * grid;
+}
+
+/** Max paired-burn outcome atoms allowed by custody USDC balance (grid-aligned). */
+export function maxPairedBurnOutcomeAtomsForCustodyUsdc(
+  custodyUsdcAtoms: bigint,
+  outcomeDecimals: number,
+  usdcDecimals: number,
+): bigint {
+  if (custodyUsdcAtoms <= 0n) return 0n;
+  const atoms = usdcBaseUnitsToOutcomeBaseUnitsDynamic(
+    custodyUsdcAtoms,
+    outcomeDecimals,
+    usdcDecimals,
+  );
+  return floorOutcomeToUsdcRedemptionGrid(atoms, outcomeDecimals, usdcDecimals);
+}
+
 /** env: optional custodian wallet; if unset, callers should use engine authority pubkey */
 export function getMintPositionsCustodyOwnerFromEnv(): PublicKey | null {
   const raw = process.env.MINT_POSITIONS_CUSTODY_PUBKEY?.trim();
@@ -52,19 +107,29 @@ export function getMintPositionsCustodyOwnerFromEnv(): PublicKey | null {
  * mapping at the token program level (1e6 USDC atoms → 1e9 outcome atoms each side).
  */
 export function usdcBaseUnitsToOutcomeBaseUnits(usdcAtoms: bigint): bigint {
-  return usdcAtoms * 10n ** OUTCOME_PER_USDC_EXP;
+  return usdcBaseUnitsToOutcomeBaseUnitsDynamic(
+    usdcAtoms,
+    OUTCOME_MINT_DECIMALS,
+    MINT_POSITIONS_USDC_DECIMALS,
+  );
 }
 
 /** Inverse of `usdcBaseUnitsToOutcomeBaseUnits` — paired burn size → custody USDC atoms. */
 export function outcomeBaseUnitsToUsdcBaseUnits(outcomeAtoms: bigint): bigint {
-  if (outcomeAtoms <= 0n) return 0n;
-  return outcomeAtoms / 10n ** OUTCOME_PER_USDC_EXP;
+  return pairedOutcomeAtomsToUsdcAtomsDynamic(
+    outcomeAtoms,
+    OUTCOME_MINT_DECIMALS,
+    MINT_POSITIONS_USDC_DECIMALS,
+  );
 }
 
 /** Floor outcome atoms so USDC redemption is whole microunits (same as mint path). */
 export function floorOutcomeAtomsToRedemptionGrid(outcomeAtoms: bigint): bigint {
-  const grid = 10n ** OUTCOME_PER_USDC_EXP;
-  return (outcomeAtoms / grid) * grid;
+  return floorOutcomeToUsdcRedemptionGrid(
+    outcomeAtoms,
+    OUTCOME_MINT_DECIMALS,
+    MINT_POSITIONS_USDC_DECIMALS,
+  );
 }
 
 export function parseOutcomeHumanToBaseUnits(amountHuman: string): bigint {

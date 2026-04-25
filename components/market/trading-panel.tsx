@@ -344,7 +344,7 @@ export function TradingPanel({
         .finally(() => {
           setSellPlanLoading(false);
         });
-    }, 420);
+    }, 650);
 
     return () => {
       ac.abort();
@@ -463,7 +463,7 @@ export function TradingPanel({
         .finally(() => {
           if (!ac.signal.aborted) setBuyExposureLoading(false);
         });
-    }, 320);
+    }, 650);
 
     return () => {
       ac.abort();

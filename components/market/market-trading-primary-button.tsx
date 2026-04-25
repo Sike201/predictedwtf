@@ -19,6 +19,16 @@ type MarketTradingPrimaryButtonProps = {
   /** Devnet USDC amount (human, 6 dp). */
   usdcAmountHuman: string;
   buyLabel: string;
+  /** When `none`, inline error text is hidden and `onTxError` receives the raw error. */
+  feedbackMode?: "inline" | "none";
+  /** Receives the raw error when `feedbackMode` is `none` or for logging from parent. */
+  onTxError?: (error: unknown) => void;
+  /** Disables the button (e.g. another action in a parent card is in flight). */
+  actionLocked?: boolean;
+  /** Replaces the default "Confirming..." while submitting. */
+  pendingLabel?: string;
+  /** Notified when a submit attempt starts and when it fully finishes. */
+  onInFlightChange?: (inFlight: boolean) => void;
   /**
    * Called after the transaction is confirmed on-chain. Parent can show signature + explorer.
    */
@@ -65,6 +75,11 @@ export function MarketTradingPrimaryButton({
   side,
   usdcAmountHuman,
   buyLabel,
+  feedbackMode = "inline",
+  onTxError,
+  actionLocked = false,
+  pendingLabel = "Confirming...",
+  onInFlightChange,
   onTradeSuccess,
   outcomeDetail,
 }: MarketTradingPrimaryButtonProps) {
@@ -106,12 +121,14 @@ export function MarketTradingPrimaryButton({
 
     buyInFlightRef.current = true;
     setSubmitting(true);
+    onInFlightChange?.(true);
     setFeedback(null);
 
     if (market.kind !== "binary") {
       setFeedback("Buys are enabled for binary YES/NO markets only.");
       buyInFlightRef.current = false;
       setSubmitting(false);
+      onInFlightChange?.(false);
       return;
     }
 
@@ -260,17 +277,23 @@ export function MarketTradingPrimaryButton({
         setFeedback(`Confirmed. View: https://explorer.solana.com/tx/${sig}?cluster=devnet`);
       }
     } catch (e) {
-      const friendly = formatTradeError(e);
-      setFeedback(friendly);
-      if (
-        typeof friendly === "string" &&
-        friendly.includes("already submitted")
-      ) {
-        router.refresh();
+      console.error("[predicted][buy-outcome-usdc] client: catch", e);
+      if (feedbackMode === "none") {
+        onTxError?.(e);
+      } else {
+        const friendly = formatTradeError(e);
+        setFeedback(friendly);
+        if (
+          typeof friendly === "string" &&
+          friendly.includes("already submitted")
+        ) {
+          router.refresh();
+        }
       }
     } finally {
       buyInFlightRef.current = false;
       setSubmitting(false);
+      onInFlightChange?.(false);
     }
   }, [
     connect,
@@ -279,10 +302,13 @@ export function MarketTradingPrimaryButton({
     market,
     publicKey,
     router,
+    onInFlightChange,
     setVisible,
     side,
     onTradeSuccess,
+    onTxError,
     outcomeDetail,
+    feedbackMode,
     signTransaction,
     usdcAmountHuman,
     wallet,
@@ -295,6 +321,7 @@ export function MarketTradingPrimaryButton({
       : "Connect wallet";
 
   const canSubmit =
+    !actionLocked &&
     connected &&
     !!publicKey &&
     !!signTransaction &&
@@ -307,15 +334,15 @@ export function MarketTradingPrimaryButton({
       <button
         type="button"
         onClick={onClick}
-        disabled={connected ? !canSubmit : connecting}
+        disabled={actionLocked || (connected ? !canSubmit : connecting)}
         className={cn(
           "relative z-10 w-full rounded-full bg-white py-3 text-[13px] font-semibold text-black transition hover:bg-zinc-100 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50",
           className,
         )}
       >
-        {connected && submitting ? "Processing…" : label}
+        {connected && submitting ? pendingLabel : label}
       </button>
-      {feedback ? (
+      {feedbackMode !== "none" && feedback ? (
         <p
           className="text-center text-[11px] leading-snug text-zinc-500"
           role="status"

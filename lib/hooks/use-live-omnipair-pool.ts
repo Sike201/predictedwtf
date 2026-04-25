@@ -15,6 +15,7 @@ import {
   logResolvedPricingOverride,
 } from "@/lib/market/resolved-binary-prices";
 import type { Market } from "@/lib/types/market";
+import { isRetriableSolanaRpcError } from "@/lib/solana/connection-resilient";
 import type { OmnipairPoolChainState } from "@/lib/solana/read-omnipair-pool-state";
 import { readOmnipairPoolState } from "@/lib/solana/read-omnipair-pool-state";
 
@@ -35,6 +36,8 @@ export type LiveOmnipairPoolState = {
    * render-only “now” tail without stale memoization.
    */
   refreshEpoch: number;
+  /** Soft warning (e.g. RPC rate limit) while keeping last good prices when possible. */
+  rpcDegradedMessage: string | null;
 };
 
 export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
@@ -48,14 +51,21 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
   const [noProbability, setNo] = useState<number | null>(null);
   const [unavailable, setUnavailable] = useState(true);
   const [oneSidedLiquidity, setOneSidedLiquidity] = useState(false);
-  const [loading, setLoading] = useState(false);
+  /** True until the first in-flight `readOmnipairPoolState` attempt finishes (or skip when no pool). */
+  const [loading, setLoading] = useState(
+    () => Boolean(poolId && yesMintId && noMintId),
+  );
   const [chainSnapshot, setChainSnapshot] = useState<OmnipairPoolChainState | null>(
     null,
   );
   const [derivedSnapshot, setDerivedSnapshot] =
     useState<DerivedMarketProbability | null>(null);
   const [refreshEpoch, setRefreshEpoch] = useState(0);
+  const [rpcDegradedMessage, setRpcDegradedMessage] = useState<string | null>(
+    null,
+  );
   const mounted = useRef(true);
+  const hadSuccessfulChainReadRef = useRef(false);
   const resolvedLogKeyRef = useRef<string | null>(null);
   /** Stabilize `refresh` identity — parent `market` can get a new object reference on a timer without any logical change, which was re-firing the initial effect and re-fetching the pool repeatedly. */
   const marketRef = useRef(market);
@@ -84,6 +94,7 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
           });
         }
         if (mounted.current) {
+          setRpcDegradedMessage(null);
           setUnavailable(false);
           setOneSidedLiquidity(false);
           setYes(resolvedPx.yes);
@@ -120,6 +131,8 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
           );
         }
         if (mounted.current) {
+          setRpcDegradedMessage(null);
+          setLoading(false);
           setUnavailable(true);
           setOneSidedLiquidity(false);
           setYes(null);
@@ -149,6 +162,8 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
 
         if (!mounted.current) return;
 
+        setRpcDegradedMessage(null);
+        hadSuccessfulChainReadRef.current = true;
         setChainSnapshot(state);
         setDerivedSnapshot(derived);
 
@@ -229,13 +244,38 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
             }),
           );
         }
+        const retriable = isRetriableSolanaRpcError(e);
         if (mounted.current) {
-          setUnavailable(true);
-          setOneSidedLiquidity(false);
-          setYes(null);
-          setNo(null);
-          setChainSnapshot(null);
-          setDerivedSnapshot(null);
+          if (retriable) {
+            setRpcDegradedMessage(
+              "RPC is temporarily rate limited. Retrying…",
+            );
+            if (!hadSuccessfulChainReadRef.current) {
+              setUnavailable(true);
+              setOneSidedLiquidity(false);
+              setYes(null);
+              setNo(null);
+              setChainSnapshot(null);
+              setDerivedSnapshot(null);
+            }
+          } else {
+            setRpcDegradedMessage(null);
+            setUnavailable(true);
+            setOneSidedLiquidity(false);
+            setYes(null);
+            setNo(null);
+            setChainSnapshot(null);
+            setDerivedSnapshot(null);
+            hadSuccessfulChainReadRef.current = false;
+          }
+        }
+        if (reason !== "retry_on_error" && mounted.current) {
+          const delayMs = retriable ? 2_500 : 1_200;
+          window.setTimeout(() => {
+            if (mounted.current) {
+              void refresh("retry_on_error");
+            }
+          }, delayMs);
         }
       } finally {
         if (mounted.current) setLoading(false);
@@ -258,5 +298,6 @@ export function useLiveOmnipairPool(market: Market): LiveOmnipairPoolState {
     derivedSnapshot,
     refresh,
     refreshEpoch,
+    rpcDegradedMessage,
   };
 }

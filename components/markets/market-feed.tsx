@@ -13,6 +13,7 @@ import {
 } from "@/lib/market/homepage-cache-warm";
 import type { Market } from "@/lib/types/market";
 import type { MarketCategoryKey, MarketSortKey } from "@/lib/types/market";
+import { useMarketNavSearch } from "@/components/providers/market-nav-search-provider";
 
 type MarketFeedProps = {
   /** Supabase `live` markets (see `fetchLiveMarketsForFeed`). */
@@ -49,6 +50,7 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
   const [markets, setMarkets] = useState(initialMarkets);
   const [sort, setSort] = useState<MarketSortKey>("trending");
   const [category, setCategory] = useState<MarketCategoryKey>("all");
+  const { query: navSearchQuery } = useMarketNavSearch();
 
   const feedKey = useMemo(
     () => initialMarkets.map((m) => m.id).join("\0"),
@@ -177,6 +179,12 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
     [markets, sort, category],
   );
 
+  const listForDisplay = useMemo(() => {
+    const q = navSearchQuery.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((m) => m.question.toLowerCase().includes(q));
+  }, [list, navSearchQuery]);
+
   return (
     <div className="bg-black px-3 pb-24 pt-4 sm:px-4 lg:px-6">
       <div className="mx-auto max-w-[1920px]">
@@ -186,7 +194,7 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
         >
-          <div className="mb-3 flex flex-wrap items-center justify-end gap-2">
+          <div className="mb-3 flex flex-wrap items-center justify-end gap-3">
             <Link
               href="/resolved"
               className="text-[11px] font-medium text-zinc-500 transition hover:text-zinc-300"
@@ -218,7 +226,7 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
             },
           }}
         >
-          {list.map((m) => (
+          {listForDisplay.map((m) => (
             <motion.div
               key={m.id}
               variants={{
@@ -236,11 +244,15 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
           ))}
         </motion.div>
 
-        {list.length === 0 && (
+        {list.length === 0 ? (
           <p className="py-16 text-center text-sm text-zinc-500">
             No markets in this category yet.
           </p>
-        )}
+        ) : listForDisplay.length === 0 ? (
+          <p className="py-16 text-center text-sm text-zinc-500">
+            No markets match your search.
+          </p>
+        ) : null}
       </div>
     </div>
   );
