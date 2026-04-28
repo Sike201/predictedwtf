@@ -68,3 +68,32 @@ export function pinataGatewayUrl(cid: string): string {
   if (!c) return "";
   return `https://gateway.pinata.cloud/ipfs/${c}`;
 }
+
+/**
+ * Resolves DB `markets.image_cid` to a usable `src` for `next/image`.
+ * Accepts bare CIDs, `ipfs://…`, full gateway URLs, and legacy double-wrapped
+ * `…/ipfs/https://gateway…/ipfs/…` rows (would break if prefixed again).
+ */
+export function marketCoverImageUrlFromStored(
+  stored: string | null | undefined,
+  slugFallback: string,
+): string {
+  const fb = `https://picsum.photos/seed/${encodeURIComponent(slugFallback)}/640/360`;
+  let raw = stored?.trim();
+  if (!raw) return fb;
+
+  while (/\/ipfs\/https?:\/\//i.test(raw)) {
+    const idx = raw.search(/\/ipfs\/https?:\/\//i);
+    raw = raw.slice(idx + "/ipfs/".length);
+  }
+
+  if (/^ipfs:\/\//i.test(raw)) {
+    raw = raw.replace(/^ipfs:\/\//i, "").replace(/^\/+/, "");
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    return raw;
+  }
+
+  return `https://gateway.pinata.cloud/ipfs/${raw.replace(/^\/+/, "")}`;
+}

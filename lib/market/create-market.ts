@@ -35,6 +35,8 @@ import {
   collectSolanaErrorDiagnostics,
   extractMissingProgramIdFromSolanaError,
   formatMissingDeployedProgramMessage,
+  formatPmammInstructionFormatMismatchMessage,
+  solanaDiagnosticsIndicateInstructionDeserializeFailure,
 } from "@/lib/solana/trace-transaction-programs";
 import {
   isNativeSolInsufficientMessage,
@@ -381,6 +383,17 @@ export async function createMarketPipeline(
           name: onChainName,
         });
         built.transaction.partialSign(treasury);
+        const sim = await connection.simulateTransaction(built.transaction);
+        if (sim.value.err) {
+          const rawLogs = sim.value.logs;
+          const logs =
+            rawLogs == null ? "" : Array.isArray(rawLogs) ? rawLogs.join("\n") : String(rawLogs);
+          throw solanaPipelineStage(
+            "FAILED_AT_PMAMM_INIT",
+            `InitializeMarket simulation failed (${JSON.stringify(sim.value.err)}). ${logs}`,
+            sim,
+          );
+        }
         const sigI = await connection.sendRawTransaction(
           built.transaction.serialize(),
           { skipPreflight: false },
@@ -799,9 +812,21 @@ export async function createMarketPipeline(
     const missingProgramId =
       (isPipelineStageError(e) && e.missingProgramId) ||
       extractMissingProgramIdFromSolanaError(e);
-    const errorMessage = missingProgramId
-      ? `${formatMissingDeployedProgramMessage(missingProgramId)} — ${message}`
-      : message;
+    const configuredPmammPid =
+      process.env.NEXT_PUBLIC_PMAMM_PROGRAM_ID?.trim() ?? "";
+    const decodeFail = solanaDiagnosticsIndicateInstructionDeserializeFailure(e);
+    const pmammInitStage =
+      isPipelineStageError(e) && e.stage === "FAILED_AT_PMAMM_INIT";
+    const isPmammInstructionFormatMismatch =
+      decodeFail &&
+      ((missingProgramId &&
+        missingProgramId === configuredPmammPid) ||
+        pmammInitStage);
+    const errorMessage = isPmammInstructionFormatMismatch
+      ? `${formatPmammInstructionFormatMismatchMessage()} — ${message}`
+      : missingProgramId
+        ? `${formatMissingDeployedProgramMessage(missingProgramId)} — ${message}`
+        : message;
     const outcomeAtaContext =
       isPipelineStageError(e) && e.stage === "FAILED_AT_OUTCOME_ATA"
         ? e.outcomeAtaContext

@@ -1,0 +1,3 @@
+# Intended devnet program pubkey (matches `lib/engines/idl/pm_amm.json` `address` after `anchor build`).
+# Deploy with `solana program deploy ...` using `target/deploy/pm_amm-keypair.json` (not committed).
+7XWTS4UpA2ZZ3L9dkHmNh3zvTK7yGHNwBqWH2aDXoY6m

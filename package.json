@@ -12,7 +12,10 @@
     "start": "next start",
     "lint": "next lint",
     "backfill:volume": "tsx scripts/backfill-last-known-volume.ts",
-    "backfill:chart": "tsx scripts/backfill-chart-history.ts"
+    "backfill:chart": "tsx scripts/backfill-chart-history.ts",
+    "pmamm:test-init": "tsx scripts/pmamm/test-init-matt-program.ts",
+    "pmamm:sim-current": "tsx scripts/pmamm/simulate-initialize-current.ts",
+    "pmamm:smoke-airdrop": "tsx scripts/pmamm/simulate-matt-initialize.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
@@ -35,6 +38,7 @@
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
+    "@types/bn.js": "^5.2.0",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

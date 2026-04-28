@@ -1,9 +1,21 @@
-import { Program, AnchorProvider, BN, type Idl } from "@coral-xyz/anchor";
+/**
+ * pmAMM Anchor client (`Program#methods` only — no manual instruction payloads).
+ * The checked-in `lib/engines/idl/pm_amm.json` must correspond to **`NEXT_PUBLIC_PMAMM_PROGRAM_ID`**
+ * (prefer copying from `contracts/pm-amm-anchor/target/idl/` after anchor build/deploy).
+ */
+import {
+  Program,
+  AnchorProvider,
+  BN,
+  type Idl,
+} from "@coral-xyz/anchor";
+import BNconstructor from "bn.js";
 import {
   ComputeBudgetProgram,
   PublicKey,
   SystemProgram,
   Transaction,
+  SYSVAR_RENT_PUBKEY,
   type Connection,
   type TransactionInstruction,
 } from "@solana/web3.js";
@@ -13,10 +25,13 @@ import {
   createAssociatedTokenAccountIdempotentInstruction,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
-import { SYSVAR_RENT_PUBKEY } from "@solana/web3.js";
 
 import pmAmmIdl from "@/lib/engines/idl/pm_amm.json";
-import { requirePmammProgramId, getPmammCollateralMint } from "./pmamm-config";
+import {
+  requirePmammProgramId,
+  getPmammCollateralMint,
+  PMAMM_PROGRAM_NOT_ON_CLUSTER_MESSAGE,
+} from "./pmamm-config";
 import {
   derivePmammMarketPdas,
   derivePmammLpPda,
@@ -24,8 +39,82 @@ import {
   PMAMM_TOKEN_METADATA_PROGRAM_ID,
 } from "./pmamm-pda";
 import { devnetTxExplorerUrl } from "@/lib/utils/solana-explorer";
+import { getSolanaRpcUrl } from "@/lib/solana/rpc-url";
 
 const CU_LIMIT = 1_400_000;
+
+function connectionEndpointHint(connection: Connection): string {
+  const c = connection as Connection & {
+    rpcEndpoint?: string;
+    _rpcEndpoint?: string;
+    commitment?: unknown;
+  };
+  return (
+    c.rpcEndpoint ?? c._rpcEndpoint ?? "(Connection endpoint unknown — see NEXT_PUBLIC_SOLANA_RPC_URL)"
+  );
+}
+
+/** Log RPC/cluster before InitializeMarket simulate/send (tasks 1 & 6). */
+export function logPmammInitializeMarketClusterContext(opts: {
+  programId: PublicKey;
+  connection: Connection;
+}): void {
+  const { programId, connection } = opts;
+  const envRpc = process.env.NEXT_PUBLIC_SOLANA_RPC_URL?.trim() ?? null;
+  const network = process.env.NEXT_PUBLIC_NETWORK?.trim() ?? null;
+  const rpcResolved = getSolanaRpcUrl();
+  const endpoint = connectionEndpointHint(connection);
+  const cm = connection as Connection & { commitment?: unknown };
+  const commitmentUsed =
+    typeof cm.commitment === "string"
+      ? cm.commitment
+      : "confirmed";
+
+  if (
+    rpcResolved.includes("mainnet-beta") ||
+    rpcResolved.includes("api.mainnet")
+  ) {
+    console.warn(
+      "[predicted][pmamm] RPC looks like mainnet — pmAMM is expected on devnet for this flow; wrong cluster causes ProgramAccountNotFound.",
+    );
+  }
+  if (rpcResolved.includes("127.0.0.1") || rpcResolved.includes("localhost")) {
+    console.warn(
+      "[predicted][pmamm] Local RPC — deploy pmAMM to this validator or use devnet RPC + deployed program id.",
+    );
+  }
+
+  const clusterParam = network?.toLowerCase().includes("main")
+    ? "mainnet-beta"
+    : "devnet";
+
+  console.info("[predicted][pmamm] init_market_cluster_context", {
+    NEXT_PUBLIC_PMAMM_PROGRAM_ID: programId.toBase58(),
+    NEXT_PUBLIC_NETWORK: network,
+    NEXT_PUBLIC_SOLANA_RPC_URL: envRpc,
+    rpcUrlResolvedFromEnv: rpcResolved,
+    connectionEndpointLogged: endpoint,
+    commitmentUsed,
+    verifyExplorerSolana: `https://explorer.solana.com/address/${programId.toBase58()}?cluster=${clusterParam}`,
+    verifyCliSuggested: `solana program show ${programId.toBase58()} --url ${rpcResolved}`,
+  });
+}
+
+/**
+ * Loads the bpf program account (`getProgramAccounts`/`getAccountInfo(programId)`).
+ * If missing, InitializeMarket will fail with ProgramAccountNotFound — fail fast instead.
+ */
+export async function ensurePmammProgramLoaderAccountExists(
+  connection: Connection,
+  programId: PublicKey,
+): Promise<void> {
+  const info = await connection.getAccountInfo(programId, "confirmed");
+  if (info != null) return;
+  throw new Error(PMAMM_PROGRAM_NOT_ON_CLUSTER_MESSAGE);
+}
+
+/** Checked-in Anchor IDL (must match bytecode at `NEXT_PUBLIC_PMAMM_PROGRAM_ID`). */
+export const PMAMM_IDL_RELATIVE_SOURCE_PATH = "lib/engines/idl/pm_amm.json";
 
 function noopWallet(pubkey: PublicKey) {
   return {
@@ -40,6 +129,18 @@ export function createPmammProgram(
   walletPubkey: PublicKey,
 ): Program<Idl> {
   const programId = requirePmammProgramId();
+  const idlFileAddr = (
+    pmAmmIdl as unknown as {
+      address?: string;
+      metadata?: { name?: string };
+    }
+  ).address?.trim();
+  if (idlFileAddr && idlFileAddr !== programId.toBase58()) {
+    console.warn(
+      "[predicted][pmamm] NEXT_PUBLIC_PMAMM_PROGRAM_ID differs from lib/engines/idl/pm_amm.json `address`; runtime uses env (risk of Anchor 102 if IDL bytecode skew). Copy target/idl from your deploy.",
+      { envProgramId: programId.toBase58(), idlAddressField: idlFileAddr },
+    );
+  }
   const idl = {
     ...(pmAmmIdl as Idl),
     address: programId.toBase58(),
@@ -182,6 +283,12 @@ export async function pmammBuildInitializeMarketTransaction(params: {
   vault: PublicKey;
 }> {
   const programId = requirePmammProgramId();
+  logPmammInitializeMarketClusterContext({
+    programId,
+    connection: params.connection,
+  });
+  await ensurePmammProgramLoaderAccountExists(params.connection, programId);
+
   const collateralMint = getPmammCollateralMint();
   const { marketPda, yesMint, noMint, vault } = derivePmammMarketPdas(
     params.marketId,
@@ -205,6 +312,14 @@ export async function pmammBuildInitializeMarketTransaction(params: {
       rent: SYSVAR_RENT_PUBKEY,
     })
     .instruction();
+
+  const args = [params.marketId, params.endTs, params.name];
+  console.log({
+    args,
+    argTypes: args.map((a) => typeof a),
+    isBN: args.map((a) => BNconstructor.isBN(a)),
+  });
+
   const tx = await baseTx(params.connection, params.authority, [ix]);
   return { transaction: tx, marketPda, yesMint, noMint, vault };
 }

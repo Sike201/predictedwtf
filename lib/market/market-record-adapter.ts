@@ -4,7 +4,7 @@ import {
   logMarketLifecycleTransition,
 } from "@/lib/market/market-lifecycle";
 import { pickActiveResolveOrExpiryRaw, parseResolveAfterEpochMs } from "@/lib/market/utc-instant";
-import { pinataGatewayUrl } from "@/lib/storage/pinata";
+import { marketCoverImageUrlFromStored } from "@/lib/storage/pinata";
 import type { MarketRecord } from "@/lib/types/market-record";
 import type {
   Market,
@@ -41,11 +41,8 @@ function coerceTopic(raw: string): MarketTopic {
  */
 export function marketRecordToMarket(record: MarketRecord, layoutIndex = 0): Market {
   const slug = record.slug;
-  const imageCid = record.image_cid?.trim();
   /** Deterministic neutral cover when no Pinata CID (Next `images.remotePatterns` includes picsum). */
-  const imageUrl = imageCid
-    ? pinataGatewayUrl(imageCid)
-    : `https://picsum.photos/seed/${encodeURIComponent(slug)}/640/360`;
+  const imageUrl = marketCoverImageUrlFromStored(record.image_cid, slug);
 
   const createdAt = Date.parse(record.created_at);
   const t = coerceTopic(record.category);

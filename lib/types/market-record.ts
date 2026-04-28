@@ -43,6 +43,8 @@ export interface MarketRecord {
   market_engine?: MarketEngine | null;
   onchain_program_id?: string | null;
   pmamm_market_address?: string | null;
+  /** Optional Supabase column — same role as `pmamm_market_address` when used. */
+  market_address?: string | null;
   usdc_mint?: string | null;
   pmamm_market_id?: string | null;
 }

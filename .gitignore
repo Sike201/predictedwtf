@@ -33,3 +33,6 @@ tsconfig.tsbuildinfo
 
 # vercel
 .vercel
+
+# pm-AMM Anchor workspace (build artifacts + program keypair — keep private)
+/contracts/pm-amm-anchor/target/

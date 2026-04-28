@@ -82,7 +82,12 @@ export function MarketResolverPanel({ market }: Props) {
           signature: signatureB64,
         }),
       });
-      const data = (await res.json()) as { error?: string; ok?: boolean };
+      const data = (await res.json()) as {
+        error?: string;
+        ok?: boolean;
+        /** PM_AMM structured errors (e.g. PMAMM_INVALID_MARKET_ACCOUNT). */
+        errorCode?: string;
+      };
       if (!res.ok || !data.ok) {
         setError(data.error ?? "Resolve failed");
         return;

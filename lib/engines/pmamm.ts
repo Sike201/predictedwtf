@@ -1,6 +1,6 @@
 /**
- * pm-AMM engine adapter ([Mattdgn/pm-amm](https://github.com/Mattdgn/pm-amm)).
- * Builds Anchor transactions for create / trade / LP / resolve / claim flows.
+ * pm-AMM engine adapter (Anchor `Program#methods` + checked-in `lib/engines/idl/pm_amm.json`).
+ * Builds transactions for create / trade / LP / resolve / claim flows.
  */
 export {
   pmammBuildInitializeMarketTransaction,
@@ -22,5 +22,14 @@ export {
   derivePmammLpPda,
   pmammMetadataPda,
 } from "@/lib/solana/pmamm-pda";
+export {
+  getPmammMarketAddressFromRow,
+  getPmammMarketAddress,
+  resolvePmammMarketPdaForChainTx,
+} from "@/lib/solana/pmamm-market-address-from-row";
+export type {
+  PmammMarketAddressRow,
+  GetPmammMarketAddressOk,
+} from "@/lib/solana/pmamm-market-address-from-row";
 export { PMAMM_CONFIG, requirePmammProgramId, getPmammCollateralMint } from "@/lib/solana/pmamm-config";
 export type { EngineTxResult } from "./types";

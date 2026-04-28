@@ -18,6 +18,9 @@ const LOG = "[predicted][enrich-market-chain]";
 const SPOT_ENRICH_CONCURRENCY = 12;
 
 async function enrichOneMarketPoolSpotOnly(market: Market): Promise<Market> {
+  if (market.engine === "PM_AMM") {
+    return withResolvedBinaryDisplay(market);
+  }
   if (!market.pool?.poolId || !market.pool.yesMint || !market.pool.noMint) {
     return market;
   }

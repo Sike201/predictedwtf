@@ -20,6 +20,7 @@ import {
   MPL_TOKEN_METADATA_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
 } from "@/lib/solana/omnipair-constants";
+import { PMAMM_MATTS_IDL_COMPAT_WARNING } from "@/lib/solana/pmamm-config";
 
 function wellKnownLabel(pk: PublicKey): string | null {
   try {
@@ -186,6 +187,19 @@ export function collectSolanaErrorDiagnostics(error: unknown): string {
   return parts.join("\n");
 }
 
+/** Anchor 102 / instruction payload decode failures (often IDL ↔ on-chain program skew). */
+export function solanaDiagnosticsIndicateInstructionDeserializeFailure(
+  error: unknown,
+): boolean {
+  const blob = collectSolanaErrorDiagnostics(error);
+  return (
+    /\bInstructionDidNotDeserialize\b/i.test(blob) ||
+    /\bAnchorError[^\n]*\b102\b/i.test(blob) ||
+    /\binstructionDidNotDeserialize\b/i.test(blob) ||
+    /\bcustom program error:\s*0x66\b/i.test(blob)
+  );
+}
+
 /** Prefer program ids that are unlikely to be system/token when reporting “missing program”. */
 export function extractMissingProgramIdFromSolanaError(
   error: unknown,
@@ -248,4 +262,9 @@ export function extractMissingProgramIdFromSolanaError(
 
 export function formatMissingDeployedProgramMessage(programId: string): string {
   return `Missing deployed program: ${programId}`;
+}
+
+/** Shown when Anchor 102 / instruction payload does not deserialize (IDL ↔ bytecode skew). */
+export function formatPmammInstructionFormatMismatchMessage(): string {
+  return `pmAMM instruction args do not match deployed program bytecode. ${PMAMM_MATTS_IDL_COMPAT_WARNING}`;
 }
