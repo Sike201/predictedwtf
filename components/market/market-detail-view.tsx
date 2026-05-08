@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { motion } from "framer-motion";
 import { useRouter } from "next/navigation";
 import {
@@ -10,6 +11,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import {
   getEffectiveDetailTrading,
@@ -18,6 +20,7 @@ import {
 } from "@/lib/market/detail-trading-surface";
 import { runPostTradeRefreshSequence } from "@/lib/market/post-trade-router-refresh";
 import type { Market } from "@/lib/types/market";
+import type { RelatedEventGroup } from "@/components/market/related-outcomes-panel";
 import {
   DETAIL_DERIVED_VOLUME_SOURCE,
   logDetailDerivedVolume,
@@ -27,13 +30,18 @@ import { useLiveOmnipairPool } from "@/lib/hooks/use-live-omnipair-pool";
 import { useMarketPriceHistory } from "@/lib/hooks/use-market-price-history";
 import { useOmnipairUserPosition } from "@/lib/hooks/use-omnipair-user-position";
 import { useWallet } from "@/lib/hooks/use-wallet";
+import { cn } from "@/lib/utils/cn";
 import { OUTCOME_MINT_DECIMALS } from "@/lib/solana/create-outcome-mints";
 import { MarketDetailHeader } from "@/components/market/market-detail-header";
 import { MarketActionsCard } from "@/components/market/market-actions-card";
+import { RelatedOutcomesPanel } from "@/components/market/related-outcomes-panel";
 import { DateTradingPanel } from "@/components/market/date-trading-panel";
 import { RaisingPanel } from "@/components/market/raising-panel";
 import { MarketResolverPanel } from "@/components/market/market-resolver-panel";
 import { YourPositionPanel } from "@/components/market/your-position-panel";
+import { GroupedTradingPanel } from "@/components/markets/grouped-trading-panel";
+import type { LiveOmnipairPoolState } from "@/lib/hooks/use-live-omnipair-pool";
+import type { MarketPriceHistoryControls } from "@/lib/hooks/use-market-price-history";
 
 const MarketChartBlock = lazy(() =>
   import("@/components/market/market-chart-block").then((m) => ({
@@ -57,6 +65,18 @@ function outcomeAtomsToHuman(atoms: string): number {
   return Number(BigInt(atoms || "0")) / 10 ** OUTCOME_MINT_DECIMALS;
 }
 
+function eventOutcomeLabel(market: Market): string {
+  const label = market.outcomeLabel?.trim();
+  if (label) return label;
+  const question = market.question.trim();
+  return question.length > 52 ? `${question.slice(0, 52).trim()}…` : question;
+}
+
+function wholePercent(p: number): string {
+  if (!Number.isFinite(p)) return "—";
+  return `${Math.round(Math.max(0, Math.min(1, p)) * 100)}%`;
+}
+
 function ChartBlockSkeleton() {
   return (
     <div className="min-h-[300px] animate-pulse rounded-xl bg-white/[0.04] ring-1 ring-white/[0.06]" />
@@ -69,18 +89,50 @@ function TabsSkeleton() {
   );
 }
 
+export type GroupedChartRenderContext = {
+  market: Market;
+  priceHistory: MarketPriceHistoryControls;
+  livePool: Pick<
+    LiveOmnipairPoolState,
+    | "yesProbability"
+    | "noProbability"
+    | "unavailable"
+    | "oneSidedLiquidity"
+    | "refreshEpoch"
+    | "loading"
+  >;
+};
+
 type MarketDetailViewProps = {
   market: Market;
   /** RSC-fetched chart points — instant first paint without client history fetch. */
   initialChartHistory?: { t: number; p: number }[];
   /** `Date.now()` when `initialChartHistory` was read on the server. */
   chartHistoryServerFetchedAtMs?: number;
+  /** Rendered inside `/events/[groupKey]`; parent supplies outcome list. */
+  embeddedInEvent?: boolean;
+  /** Sibling markets for winner-style groups (feed uses same dedupe rules). */
+  eventGroup?: RelatedEventGroup | null;
+  /** Event pages can provide a grouped chart while reusing the selected market trade rail. */
+  eventChartSlot?: ReactNode;
+  /** Prefer over `eventChartSlot`: receives live pool + history from this view’s hooks. */
+  renderGroupedChart?: (ctx: GroupedChartRenderContext) => ReactNode;
+  /** Grouped event pages: outcome picker rendered above the trade rail. */
+  eventSidebarLead?: ReactNode;
+  /** When set with `embeddedInEvent`, shows the normal detail header using this title (group/event question). */
+  eventPageTitle?: string | null;
 };
 
 export function MarketDetailView({
   market,
   initialChartHistory,
   chartHistoryServerFetchedAtMs,
+  embeddedInEvent = false,
+  eventGroup = null,
+  eventChartSlot,
+  renderGroupedChart,
+  eventSidebarLead,
+  eventPageTitle,
 }: MarketDetailViewProps) {
   const router = useRouter();
   const isBinary = market.kind === "binary";
@@ -412,8 +464,132 @@ export function MarketDetailView({
     [priceHistory, livePool.refresh],
   );
 
+  const groupedChartCtx = useMemo(
+    (): GroupedChartRenderContext => ({
+      market: displayMarket,
+      priceHistory,
+      livePool,
+    }),
+    [displayMarket, livePool, priceHistory],
+  );
+
+  const eventTradeContext = useMemo(() => {
+    if (!embeddedInEvent) return null;
+    const staticYes = displayMarket.pool?.yesPrice ?? displayMarket.yesProbability;
+    const staticNo = displayMarket.pool?.noPrice ?? 1 - displayMarket.yesProbability;
+    const useLive =
+      livePool.yesProbability != null &&
+      livePool.noProbability != null &&
+      !livePool.unavailable &&
+      !livePool.oneSidedLiquidity;
+    return {
+      label: eventOutcomeLabel(displayMarket),
+      yes: useLive ? livePool.yesProbability! : staticYes,
+      no: useLive ? livePool.noProbability! : staticNo,
+    };
+  }, [
+    displayMarket,
+    embeddedInEvent,
+    livePool.noProbability,
+    livePool.oneSidedLiquidity,
+    livePool.unavailable,
+    livePool.yesProbability,
+  ]);
+
+  const sidebarInner = (
+    <>
+      {eventSidebarLead}
+      {eventTradeContext ? (
+        eventSidebarLead ? null : (
+          <div className="rounded-xl bg-[#111] p-3 ring-1 ring-white/[0.06]">
+            <div className="flex items-center gap-3">
+              <div className="relative h-10 w-10 shrink-0 overflow-hidden rounded-full bg-zinc-900 ring-1 ring-white/[0.08]">
+                <Image
+                  src={displayMarket.imageUrl}
+                  alt=""
+                  fill
+                  sizes="40px"
+                  className="object-cover"
+                />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-600">
+                  Trading outcome
+                </p>
+                <p className="mt-0.5 truncate text-[14px] font-semibold text-white">
+                  {eventTradeContext.label}
+                </p>
+              </div>
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <div className="rounded-lg bg-emerald-400/10 px-3 py-2">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-emerald-300/80">
+                  YES
+                </p>
+                <p className="mt-0.5 font-mono text-[15px] font-semibold tabular-nums text-emerald-300">
+                  {wholePercent(eventTradeContext.yes)}
+                </p>
+              </div>
+              <div className="rounded-lg bg-red-500/10 px-3 py-2">
+                <p className="text-[10px] font-semibold uppercase tracking-wide text-red-300/80">
+                  NO
+                </p>
+                <p className="mt-0.5 font-mono text-[15px] font-semibold tabular-nums text-red-300">
+                  {wholePercent(eventTradeContext.no)}
+                </p>
+              </div>
+            </div>
+          </div>
+        )
+      ) : null}
+      {displayMarket.phase === "raising" && <RaisingPanel market={displayMarket} />}
+      {displayMarket.phase === "trading" && !isBinary && (
+        <DateTradingPanel market={displayMarket} />
+      )}
+      {isBinary &&
+        (displayMarket.phase === "trading" ||
+          displayMarket.phase === "resolving" ||
+          displayMarket.phase === "resolved") && (
+          <>
+            {isBinary &&
+            !isResolved &&
+            (displayMarket.phase === "trading" || displayMarket.phase === "resolving") ? (
+              <MarketResolverPanel market={displayMarket} />
+            ) : null}
+            <MarketActionsCard
+              market={displayMarket}
+              variant="market"
+              initialActionTab="buy"
+              poolPriceLoading={livePool.loading}
+              {...(showPositionPanel && displayMarket.pool
+                ? {
+                    liveYesProbability: livePool.yesProbability ?? undefined,
+                    liveNoProbability: livePool.noProbability ?? undefined,
+                    livePriceUnavailable: livePool.unavailable,
+                    oneSidedLiquidity: livePool.oneSidedLiquidity,
+                    onPoolTxSettled,
+                    onOmnipairRefresh: omnipairHook.refresh,
+                    onTradePriceSnapshot,
+                    onLeverageAfterTx: isResolved
+                      ? undefined
+                      : onLeverageAfterTx,
+                    omnipairSnapshot: omnipairHook.snapshot,
+                  }
+                : {})}
+            />
+          </>
+        )}
+    </>
+  );
+
   return (
-    <div className="min-h-screen bg-black pb-24 pt-4 text-zinc-100 sm:pt-5">
+    <div
+      className={
+        embeddedInEvent && !eventPageTitle
+          ? "bg-black pb-6 pt-0 text-zinc-100"
+          : "min-h-screen bg-black pb-24 pt-4 text-zinc-100 sm:pt-5"
+      }
+    >
       <div className="mx-auto max-w-[1600px] px-4 sm:px-6">
         <motion.div
           initial={{ opacity: 0, y: 12 }}
@@ -436,26 +612,32 @@ export function MarketDetailView({
               {livePool.rpcDegradedMessage}
             </div>
           ) : null}
-          <MarketDetailHeader
-            market={displayMarket}
-            liveYesProbability={
-              tradingOpen || (isBinary && isResolved)
-                ? livePool.yesProbability
-                : undefined
-            }
-            detailVolume={{
-              hasPool: detailDerivedVol.hasPool,
-              loading: detailDerivedVol.loading,
-              volumeUsd:
-                detailDerivedVol.derived !== null
-                  ? detailDerivedVol.derived.volumeUsd
-                  : null,
-              swapsParsed: detailDerivedVol.derived?.swapsParsed ?? 0,
-              signaturesScanned:
-                detailDerivedVol.derived?.signaturesScanned ?? 0,
-              error: detailDerivedVol.error,
-            }}
-          />
+          {!embeddedInEvent || eventPageTitle ? (
+            <MarketDetailHeader
+              market={
+                embeddedInEvent && eventPageTitle != null
+                  ? { ...displayMarket, question: eventPageTitle }
+                  : displayMarket
+              }
+              liveYesProbability={
+                tradingOpen || (isBinary && isResolved)
+                  ? livePool.yesProbability
+                  : undefined
+              }
+              detailVolume={{
+                hasPool: detailDerivedVol.hasPool,
+                loading: detailDerivedVol.loading,
+                volumeUsd:
+                  detailDerivedVol.derived !== null
+                    ? detailDerivedVol.derived.volumeUsd
+                    : null,
+                swapsParsed: detailDerivedVol.derived?.swapsParsed ?? 0,
+                signaturesScanned:
+                  detailDerivedVol.derived?.signaturesScanned ?? 0,
+                error: detailDerivedVol.error,
+              }}
+            />
+          ) : null}
         </motion.div>
 
         <div className="mt-4 grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(300px,360px)] lg:items-start lg:gap-6">
@@ -465,14 +647,26 @@ export function MarketDetailView({
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.58, ease: [0.16, 1, 0.3, 1] }}
           >
-            <Suspense fallback={<ChartBlockSkeleton />}>
-              <MarketChartBlock
-                market={displayMarket}
-                tradingBinary={chartOmnipairEnabled}
-                livePool={livePool}
-                priceHistory={priceHistory}
+            {eventGroup && !embeddedInEvent ? (
+              <RelatedOutcomesPanel
+                currentSlug={market.id}
+                group={eventGroup}
               />
-            </Suspense>
+            ) : null}
+            {renderGroupedChart ? (
+              renderGroupedChart(groupedChartCtx)
+            ) : eventChartSlot ? (
+              eventChartSlot
+            ) : (
+              <Suspense fallback={<ChartBlockSkeleton />}>
+                <MarketChartBlock
+                  market={displayMarket}
+                  tradingBinary={chartOmnipairEnabled}
+                  livePool={livePool}
+                  priceHistory={priceHistory}
+                />
+              </Suspense>
+            )}
 
             {showYourPositionBlock ? (
               <YourPositionPanel
@@ -529,7 +723,10 @@ export function MarketDetailView({
           </motion.div>
 
           <motion.aside
-            className="relative z-10 space-y-4 lg:sticky lg:top-20"
+            className={cn(
+              "relative z-10 lg:sticky lg:top-20",
+              !eventSidebarLead && "space-y-4",
+            )}
             initial={{ opacity: 0, y: 16 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{
@@ -538,42 +735,10 @@ export function MarketDetailView({
               ease: [0.16, 1, 0.3, 1],
             }}
           >
-            {displayMarket.phase === "raising" && <RaisingPanel market={displayMarket} />}
-            {displayMarket.phase === "trading" && !isBinary && (
-              <DateTradingPanel market={displayMarket} />
-            )}
-            {isBinary &&
-              (displayMarket.phase === "trading" ||
-                displayMarket.phase === "resolving" ||
-                displayMarket.phase === "resolved") && (
-              <>
-                {isBinary &&
-                !isResolved &&
-                (displayMarket.phase === "trading" || displayMarket.phase === "resolving") ? (
-                  <MarketResolverPanel market={displayMarket} />
-                ) : null}
-                <MarketActionsCard
-                  market={displayMarket}
-                  variant="market"
-                  initialActionTab="buy"
-                  poolPriceLoading={livePool.loading}
-                  {...(showPositionPanel && displayMarket.pool
-                    ? {
-                        liveYesProbability: livePool.yesProbability ?? undefined,
-                        liveNoProbability: livePool.noProbability ?? undefined,
-                        livePriceUnavailable: livePool.unavailable,
-                        oneSidedLiquidity: livePool.oneSidedLiquidity,
-                        onPoolTxSettled,
-                        onOmnipairRefresh: omnipairHook.refresh,
-                        onTradePriceSnapshot,
-                        onLeverageAfterTx: isResolved
-                          ? undefined
-                          : onLeverageAfterTx,
-                        omnipairSnapshot: omnipairHook.snapshot,
-                      }
-                    : {})}
-                />
-              </>
+            {eventSidebarLead ? (
+              <GroupedTradingPanel>{sidebarInner}</GroupedTradingPanel>
+            ) : (
+              sidebarInner
             )}
           </motion.aside>
         </div>

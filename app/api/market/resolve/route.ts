@@ -17,10 +17,11 @@ import { requirePmammProgramId } from "@/lib/solana/pmamm-config";
 import {
   friendlyMessageForPmammResolveRpcFailure,
   logPmammResolveMarketInstructionAccounts,
+  pickPmammResolveServerSigner,
   validatePmammMarketAccountBeforeResolve,
   PMAMM_RESOLVE_ERROR_CODE,
 } from "@/lib/solana/pmamm-resolve-validation";
-import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
+import { loadMarketEngineAuthority, loadTrustedResolverSigner } from "@/lib/solana/treasury";
 import { transactionExplorerUrl } from "@/lib/utils/solana-explorer";
 
 export const runtime = "nodejs";
@@ -139,11 +140,13 @@ export async function POST(req: Request) {
   }
 
   if ((row as { resolver_wallet: string }).resolver_wallet !== TRUSTED_RESOLVER_ADDRESS) {
-    console.info(LOG, "resolve_rejected", { reason: "resolver_mismatch", slug });
-    return NextResponse.json(
-      { error: "Market resolver is not the trusted resolver" },
-      { status: 400 },
-    );
+    console.info(LOG, "resolver_wallet_differs_from_current_trusted_resolver", {
+      slug,
+      market_resolver_wallet: (row as { resolver_wallet: string }).resolver_wallet,
+      TRUSTED_RESOLVER_ADDRESS,
+      note:
+        "Proceeding because resolver authorization is the trusted resolver signature; older markets may store a previous resolver wallet.",
+    });
   }
 
   const afterIso = (row as { resolve_after?: string; expiry_ts?: string })
@@ -172,7 +175,7 @@ export async function POST(req: Request) {
       return NextResponse.json(
         {
           error:
-            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required for pmAMM resolve_market (must be the same keypair as initialize_market authority).",
+            "Server missing MARKET_ENGINE_AUTHORITY_SECRET — required for pmAMM resolve when the on-chain market is keyed to that authority (or set TRUSTED_RESOLVER_SECRET when market.resolver is the trusted wallet).",
         },
         { status: 503 },
       );
@@ -301,46 +304,87 @@ export async function POST(req: Request) {
       });
     }
 
-    if (
-      validated.authority &&
-      !validated.authority.equals(treasury.publicKey)
-    ) {
-      console.error(LOG, "pmamm_resolve_authority_mismatch", {
-        slug,
-        serverAuthority: treasury.publicKey.toBase58(),
-        marketAuthority: validated.authority.toBase58(),
-        authority_check_skipped: false,
-      });
-      return NextResponse.json(
-        {
-          error:
-            "MARKET_ENGINE_AUTHORITY must match this market's on-chain authority (same wallet used when initialize_market ran). Update MARKET_ENGINE_AUTHORITY_SECRET.",
-          errorCode: PMAMM_RESOLVE_ERROR_CODE.AUTHORITY_MISMATCH,
-        },
-        { status: 503 },
-      );
-    }
     if (!validated.authority) {
       console.warn(LOG, "pmamm_resolve_authority_skipped", {
         slug,
         reason:
           "Could not read market authority (discriminator/IDL mismatch). Proceeding with on-chain resolve; program will reject wrong signer.",
       });
+      return NextResponse.json(
+        {
+          error:
+            "Could not read on-chain market authority — check IDL/program deployment matches NEXT_PUBLIC_PMAMM_PROGRAM_ID.",
+          errorCode: PMAMM_RESOLVE_ERROR_CODE.INVALID_MARKET_ACCOUNT,
+        },
+        { status: 503 },
+      );
+    }
+
+    const trustedKp = loadTrustedResolverSigner();
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const expired = validated.endTs <= BigInt(nowSec);
+
+    const picked = pickPmammResolveServerSigner({
+      treasury,
+      trusted: trustedKp,
+      marketAuthority: validated.authority,
+      marketResolver: validated.resolver,
+    });
+
+    console.info(LOG, "pmamm_resolve_signer_debug", {
+      slug,
+      onChainMarket_authority: validated.authority.toBase58(),
+      onChainMarket_resolver: validated.resolver?.toBase58() ?? null,
+      TRUSTED_RESOLVER_ADDRESS,
+      TRUSTED_RESOLVER_SECRET_loaded: Boolean(trustedKp),
+      TRUSTED_RESOLVER_SECRET_pubkey: trustedKp?.publicKey.toBase58() ?? null,
+      MARKET_ENGINE_AUTHORITY_pubkey: treasury.publicKey.toBase58(),
+      chosen_signer: picked.ok ? picked.signer.publicKey.toBase58() : null,
+      chosen_signer_label: picked.ok ? picked.label : null,
+      signerMatchesResolver: picked.ok
+        ? validated.resolver != null && picked.signer.publicKey.equals(validated.resolver)
+        : false,
+      signerMatchesAuthority: picked.ok
+        ? picked.signer.publicKey.equals(validated.authority)
+        : false,
+      expired,
+      end_ts_unix: validated.endTs.toString(),
+      now_sec: nowSec,
+      pick_ok: picked.ok,
+    });
+
+    if (!picked.ok) {
+      console.error(LOG, "pmamm_resolve_no_authorized_signer", {
+        slug,
+        detail: picked.detail,
+      });
+      return NextResponse.json(
+        {
+          error:
+            "Server has no keypair matching this market's on-chain authority or resolver. Configure MARKET_ENGINE_AUTHORITY_SECRET (initialize_market payer / market.authority) and/or TRUSTED_RESOLVER_SECRET (must equal on-chain market.resolver when that field is set).",
+          errorCode: PMAMM_RESOLVE_ERROR_CODE.AUTHORITY_MISMATCH,
+          ...(process.env.NODE_ENV === "development"
+            ? { developerDetail: picked.detail }
+            : {}),
+        },
+        { status: 503 },
+      );
     }
 
     try {
       const tx = await pmammBuildResolveMarketTransaction({
         connection,
-        authority: treasury.publicKey,
+        resolverSigner: picked.signer.publicKey,
         marketPda,
         winningSide: winningOutcome,
       });
-      tx.partialSign(treasury);
+      tx.partialSign(picked.signer);
       logPmammResolveMarketInstructionAccounts({
         tx,
         programId,
         slug: slug!,
-        walletLabel: "MARKET_ENGINE_AUTHORITY (resolve_signer)",
+        walletLabel: `resolve_signer: ${picked.label}`,
       });
       const sig = await connection.sendRawTransaction(tx.serialize(), {
         skipPreflight: false,
@@ -362,6 +406,18 @@ export async function POST(req: Request) {
         slug,
         rawDetail,
         friendlyUi: friendlyOnly,
+        pmamm_resolve_signer_debug_on_error: {
+          onChainMarket_authority: validated.authority.toBase58(),
+          onChainMarket_resolver: validated.resolver?.toBase58() ?? null,
+          TRUSTED_RESOLVER_ADDRESS,
+          signer_used: picked.signer.publicKey.toBase58(),
+          chosen_signer_label: picked.label,
+          signerMatchesResolver:
+            validated.resolver != null &&
+            picked.signer.publicKey.equals(validated.resolver),
+          signerMatchesAuthority: picked.signer.publicKey.equals(validated.authority),
+          expired: validated.endTs <= BigInt(Math.floor(Date.now() / 1000)),
+        },
         e,
       });
       return NextResponse.json(

@@ -18,7 +18,7 @@ pub const NO_MINT_SEED: &[u8] = b"no_mint";
 pub const VAULT_SEED: &[u8] = b"vault";
 
 #[derive(Accounts)]
-#[instruction(market_id: u64)]
+#[instruction(market_id: u64, end_ts: i64, name: String, resolver: Pubkey)]
 pub struct InitializeMarket<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -84,16 +84,20 @@ pub struct InitializeMarket<'info> {
 }
 
 /// Create a new prediction market with YES/NO mints and USDC vault.
+///
+/// Instruction data order (must match IDL / TS `initializeMarket`): `market_id`, `end_ts`, `name`, `resolver`.
+/// `collateral_mint` is an account, not an argument.
 pub fn handler(
     ctx: Context<InitializeMarket>,
     market_id: u64,
     end_ts: i64,
     name: String,
+    resolver: Pubkey,
 ) -> Result<()> {
     let clock = Clock::get()?;
     let now = clock.unix_timestamp;
 
-    /// Minimum market duration in seconds (5 minutes).
+    // Minimum market duration in seconds (5 minutes).
     const MIN_DURATION_SECS: i64 = 300;
 
     require!(
@@ -105,7 +109,16 @@ pub fn handler(
         PmAmmError::InvalidName
     );
 
+    msg!("pmamm Market layout: resolver_before_name (layout_version=2)");
+    msg!("Market::LEN = {}", Market::LEN);
+
     let market = &mut ctx.accounts.market;
+
+    msg!("initialize_market resolver arg: {}", resolver);
+    msg!(
+        "initialize_market authority: {}",
+        ctx.accounts.authority.key()
+    );
 
     market.authority = ctx.accounts.authority.key();
     market.market_id = market_id;
@@ -121,6 +134,16 @@ pub fn handler(
     let src = name.as_bytes();
     name_bytes[..src.len()].copy_from_slice(src);
     market.name = name_bytes;
+
+    // Dedicated early resolver (defaults to authority when unset).
+    market.resolver = if resolver == Pubkey::default() {
+        ctx.accounts.authority.key()
+    } else {
+        resolver
+    };
+    msg!("initialize_market stored resolver: {}", market.resolver);
+
+    market.reserved = [0u8; 32];
 
     // AMM starts empty — deposit will bootstrap L_0
     market.l_zero = 0;
@@ -144,6 +167,7 @@ pub fn handler(
     market.winning_side = 0;
 
     market.bump = ctx.bumps.market;
+    market.layout_version = 2;
 
     // Signer seeds for Market PDA (mint authority)
     let id_bytes = market_id.to_le_bytes();

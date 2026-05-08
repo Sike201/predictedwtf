@@ -1,19 +1,33 @@
+import { resolveMarketDraftExpiry } from "@/lib/market/draft-expiry-resolve";
 import {
   formatMarketEndTimeIsoForDatabase,
+  parseInstantUtcMs,
   resolveMarketExpiryInputForDatabase,
 } from "@/lib/market/utc-instant";
 import type { MarketDraft } from "@/lib/types/market";
 
-/** Parsed Grok JSON from MARKET_VALIDATION_SYSTEM_PROMPT. */
+/** Parsed Grok JSON (single-market payload or legacy validation shape). */
 export interface GrokValidationJson {
+  error?: string;
+  message?: string;
+  question?: string;
+  yesCondition?: string;
+  noCondition?: string;
+  endTimeUtc?: string;
+  warning?: string | null;
+  /** Human-readable outcome row label for grouped events (stored in DB). */
+  outcomeLabel?: string;
+  outcome_label?: string;
+  /** Legacy snake_case / old schema (still accepted if model returns them). */
+  yes_condition?: string;
+  no_condition?: string;
+  end_time_utc?: string;
   valid?: boolean;
   title?: string;
   description?: string;
   expiry_iso?: string;
   subject?: string;
   resolution_source?: string;
-  yes_condition?: string;
-  no_condition?: string;
   rules?: string[];
   image_requirements?: string;
   ambiguity_flags?: string[];
@@ -22,35 +36,87 @@ export interface GrokValidationJson {
   needs_revision?: boolean;
 }
 
+function pickYesCondition(p: GrokValidationJson): string {
+  return (p.yesCondition ?? p.yes_condition ?? "").trim();
+}
+
+function pickNoCondition(p: GrokValidationJson): string {
+  return (p.noCondition ?? p.no_condition ?? "").trim();
+}
+
+function pickEndTimeRaw(p: GrokValidationJson): string {
+  return (p.endTimeUtc ?? p.end_time_utc ?? p.expiry_iso ?? "").trim();
+}
+
+function pickQuestion(p: GrokValidationJson, fallback: string): string {
+  return (p.question ?? p.title ?? "").trim() || fallback;
+}
+
+function pickWarning(p: GrokValidationJson): string | null {
+  const w = p.warning;
+  if (w == null) return null;
+  const t = typeof w === "string" ? w.trim() : "";
+  return t.length > 0 ? t : null;
+}
+
 function expiryForDraftFromGrok(
-  expiryIso: string | undefined,
-  userPrompt: string,
+  expiryRaw: string,
+  latestUserPrompt: string,
   grokTitle: string,
+  fallback: MarketDraft,
 ): string {
-  const raw = expiryIso?.trim() ?? "";
-  const titleBlock = [userPrompt, grokTitle].filter(Boolean).join("\n");
+  const raw = expiryRaw.trim();
+  const phraseBlock = [latestUserPrompt, grokTitle, fallback.question]
+    .filter(Boolean)
+    .join("\n");
+  const fb = fallback.expiry.trim();
+  const resolvedRaw = resolveMarketDraftExpiry({
+    expiryRaw: raw,
+    phraseBlock,
+    fallbackIso: fb || new Date(Date.now() + 365 * 864e5).toISOString(),
+  });
+  const titleBlock = phraseBlock;
   const resolved = resolveMarketExpiryInputForDatabase({
-    draftExpiry: raw,
+    draftExpiry: resolvedRaw,
     title: titleBlock,
   });
-  return formatMarketEndTimeIsoForDatabase(resolved.finalInput);
+  try {
+    const formatted = formatMarketEndTimeIsoForDatabase(resolved.finalInput);
+    const ms = parseInstantUtcMs(formatted);
+    if (ms == null) {
+      const fbMs = parseInstantUtcMs(fb);
+      return fbMs != null ? new Date(fbMs).toISOString() : formatted;
+    }
+    return new Date(ms).toISOString();
+  } catch {
+    const fbMs = parseInstantUtcMs(fb);
+    return fbMs != null ? new Date(fbMs).toISOString() : fb;
+  }
 }
 
 export function grokValidationToMarketDraft(
   parsed: GrokValidationJson,
   fallback: MarketDraft,
+  latestUserPrompt: string,
 ): MarketDraft {
-  const title = parsed.title?.trim() || fallback.question;
-  const description = parsed.description?.trim() || fallback.description;
+  const title = pickQuestion(parsed, fallback.question);
+  const description =
+    parsed.description?.trim() ||
+    "Binary YES/NO market. Outcome follows the conditions below.";
   const expiry = expiryForDraftFromGrok(
-    parsed.expiry_iso,
-    fallback.question,
+    pickEndTimeRaw(parsed),
+    latestUserPrompt,
     title,
+    fallback,
   );
 
+  const yes = pickYesCondition(parsed);
+  const no = pickNoCondition(parsed);
+  const warning = pickWarning(parsed);
+
   const ruleLines = [
-    parsed.yes_condition?.trim() && `YES: ${parsed.yes_condition.trim()}`,
-    parsed.no_condition?.trim() && `NO: ${parsed.no_condition.trim()}`,
+    yes && `YES: ${yes}`,
+    no && `NO: ${no}`,
     ...(Array.isArray(parsed.rules) ? parsed.rules.map((r) => r?.trim()).filter(Boolean) : []),
   ].filter(Boolean) as string[];
 
@@ -58,9 +124,10 @@ export function grokValidationToMarketDraft(
     ruleLines.length > 0 ? ruleLines.join("\n\n") : fallback.resolutionRules;
 
   const reasoningParts = [
+    warning && `Note: ${warning}`,
     parsed.subject?.trim() && `Subject: ${parsed.subject.trim()}`,
     typeof parsed.verifiability_score === "number" &&
-      `Verifiability: ${parsed.verifiability_score}/100`,
+      `Verifiability (legacy score): ${parsed.verifiability_score}/100`,
     parsed.image_requirements?.trim() &&
       `Cover image should show: ${parsed.image_requirements.trim()}`,
     Array.isArray(parsed.ambiguity_flags) &&
@@ -69,12 +136,11 @@ export function grokValidationToMarketDraft(
   ].filter(Boolean) as string[];
 
   const suggestedRules =
-    Array.isArray(parsed.rules) && parsed.rules.length > 0
-      ? parsed.rules
-      : [
-          parsed.yes_condition?.trim(),
-          parsed.no_condition?.trim(),
-        ].filter(Boolean) as string[];
+    yes && no
+      ? [yes, no]
+      : Array.isArray(parsed.rules) && parsed.rules.length > 0
+        ? parsed.rules
+        : fallback.suggestedRules;
 
   const out: MarketDraft = {
     question: title,
@@ -82,8 +148,10 @@ export function grokValidationToMarketDraft(
     expiry,
     resolutionRules,
     resolutionSource:
-      parsed.resolution_source?.trim() || fallback.resolutionSource,
-    aiReasoning: reasoningParts.length > 0 ? reasoningParts.join("\n") : fallback.aiReasoning,
+      parsed.resolution_source?.trim() ||
+      "Public information as interpreted by the market resolver.",
+    aiReasoning:
+      reasoningParts.length > 0 ? reasoningParts.join("\n") : fallback.aiReasoning,
     suggestedRules: suggestedRules.length > 0 ? suggestedRules : fallback.suggestedRules,
   };
 
@@ -94,20 +162,8 @@ export function grokValidationToMarketDraft(
   return out;
 }
 
-export function buildInvalidAssistantMessage(parsed: GrokValidationJson): string {
-  const lines: string[] = [];
-  if (Array.isArray(parsed.missing_information)) {
-    for (const m of parsed.missing_information) {
-      const t = m?.trim();
-      if (t) lines.push(t);
-    }
-  }
-  if (Array.isArray(parsed.ambiguity_flags)) {
-    for (const a of parsed.ambiguity_flags) {
-      const t = a?.trim();
-      if (t) lines.push(t);
-    }
-  }
-  if (lines.length > 0) return lines.join("\n\n");
-  return "This market isn’t specific enough for objective resolution. Add a clear YES/NO, a precise calendar deadline, and a verifiable public source.";
+/** User-visible note when the model sets a non-null warning. */
+export function formatAssistantNoteFromWarning(warning: string | null): string | null {
+  if (!warning?.trim()) return null;
+  return warning.trim();
 }

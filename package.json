@@ -11,6 +11,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "verify:create-assistant": "tsx scripts/verify-create-assistant-turn.ts",
     "backfill:volume": "tsx scripts/backfill-last-known-volume.ts",
     "backfill:chart": "tsx scripts/backfill-chart-history.ts",
     "pmamm:test-init": "tsx scripts/pmamm/test-init-matt-program.ts",
@@ -18,7 +19,7 @@
     "pmamm:smoke-airdrop": "tsx scripts/pmamm/simulate-matt-initialize.ts"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.30.1",
+    "@coral-xyz/anchor": "^0.32.1",
     "@solana/spl-token": "^0.4.9",
     "@solana/wallet-adapter-base": "^0.9.27",
     "@solana/wallet-adapter-react": "^0.15.39",

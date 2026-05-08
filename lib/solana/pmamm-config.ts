@@ -18,6 +18,14 @@ export const PMAMM_ADAPTER_MISMATCH_USER_MESSAGE =
   "pmAMM TS client (`lib/solana/pmamm-program.ts` + checked-in IDL) does not match the program at NEXT_PUBLIC_PMAMM_PROGRAM_ID.";
 
 /**
+ * Byte offset of `resolver` in the Market account **body** (Borsh), **excluding** the 8-byte Anchor
+ * account discriminator. Must match field order in `programs/pm_amm/src/state.rs` (`Market`) and
+ * `market_anchor_serialize_includes_resolver_before_name` in the same crate.
+ * Applies when `layout_version >= 2` (see on-chain `Market` struct).
+ */
+export const PMAMM_MARKET_RESOLVER_BODY_OFFSET = 308;
+
+/**
  * Predicted wiring: **`NEXT_PUBLIC_PMAMM_PROGRAM_ID`** must equal the pubkey in **`lib/engines/idl/pm_amm.json`** for that deployment (copy from `contracts/pm-amm-anchor/target/idl/pm_amm.json` after build).
  */
 export const PMAMM_CONFIG = {

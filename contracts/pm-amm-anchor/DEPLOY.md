@@ -23,6 +23,20 @@ After a successful deploy, copy the IDL used by the app:
 cp target/idl/pm_amm.json ../../lib/engines/idl/pm_amm.json
 ```
 
+### Verify bytecode on-chain matches local ELF
+
+Program uploads can appear “stuck” while the chain still runs an older binary. Compare hashes:
+
+```bash
+# From repo root, with your app RPC (Helius, etc.):
+HELIUS_RPC="your-devnet-rpc-url"
+PID=7XWTS4UpA2ZZ3L9dkHmNh3zvTK7yGHNwBqWH2aDXoY6m   # or your declare_id / .env program id
+solana program dump "$PID" /tmp/pm_amm-devnet-dump.so --url "$HELIUS_RPC"
+shasum -a 256 contracts/pm-amm-anchor/target/deploy/pm_amm.so /tmp/pm_amm-devnet-dump.so
+```
+
+If digests differ, the upgraded `.so` is **not** what that RPC is serving — redeploy (ensure upgrade authority wallet has enough SOL for buffer rent; use `solana program extend` if the new ELF is larger than the current program data account).
+
 Set in `.env`:
 
 ```bash

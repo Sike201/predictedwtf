@@ -18,7 +18,7 @@ cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "pnpm exec ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+test = "npx ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
 
 [hooks]
 
@@ -31,3 +31,9 @@ upgradeable = false
 bind_address = "0.0.0.0"
 ledger = ".anchor/test-ledger"
 rpc_port = 8899
+
+# Metaplex Token Metadata — required for initialize_market CPI on localnet.
+# Needs RPC access on first ledger init to fetch the program account.
+[[test.validator.clone]]
+address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+url = "https://api.devnet.solana.com"

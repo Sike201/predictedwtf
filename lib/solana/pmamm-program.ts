@@ -7,6 +7,7 @@ import {
   Program,
   AnchorProvider,
   BN,
+  BorshInstructionCoder,
   type Idl,
 } from "@coral-xyz/anchor";
 import BNconstructor from "bn.js";
@@ -154,6 +155,8 @@ export function createPmammProgram(
 }
 
 type PmammMarketAccountData = {
+  authority: PublicKey;
+  resolver: PublicKey;
   collateralMint: PublicKey;
   vault: PublicKey;
   yesMint: PublicKey;
@@ -170,6 +173,8 @@ export async function fetchPmammMarketAccount(
   marketPda: PublicKey,
 ): Promise<PmammMarketAccountData> {
   type Fetched = {
+    authority: PublicKey;
+    resolver: PublicKey;
     collateralMint: PublicKey;
     vault: PublicKey;
     yesMint: PublicKey;
@@ -184,7 +189,17 @@ export async function fetchPmammMarketAccount(
     account: { market: { fetch: (p: PublicKey) => Promise<Fetched> } };
   };
   const a = await raw.account.market.fetch(marketPda);
+  if (process.env.NODE_ENV === "development") {
+    console.info("[pmAMM fetchPmammMarketAccount]", {
+      NEXT_PUBLIC_PMAMM_PROGRAM_ID:
+        process.env.NEXT_PUBLIC_PMAMM_PROGRAM_ID?.trim() ?? null,
+      program_programId: program.programId.toBase58(),
+      marketPda: marketPda.toBase58(),
+    });
+  }
   return {
+    authority: a.authority,
+    resolver: a.resolver,
     collateralMint: a.collateralMint,
     vault: a.vault,
     yesMint: a.yesMint,
@@ -272,6 +287,8 @@ async function maybeUsdcAtaIx(
 export async function pmammBuildInitializeMarketTransaction(params: {
   connection: Connection;
   authority: PublicKey;
+  /** On-chain resolver — required (no authority fallback). */
+  resolver: PublicKey;
   marketId: BN;
   endTs: BN;
   name: string;
@@ -281,8 +298,24 @@ export async function pmammBuildInitializeMarketTransaction(params: {
   yesMint: PublicKey;
   noMint: PublicKey;
   vault: PublicKey;
+  /** From Borsh decode of built `initialize_market` ix; null if decode failed. */
+  decodedInitializeMarketResolverArg: string | null;
 }> {
+  if (!params.resolver) {
+    throw new Error("pmAMM init resolver is required");
+  }
+  const envTrusted = process.env.TRUSTED_RESOLVER_ADDRESS?.trim();
+  if (
+    process.env.TRUSTED_RESOLVER_ADDRESS &&
+    params.resolver.toBase58() !== envTrusted
+  ) {
+    throw new Error(
+      `pmAMM init resolver param mismatch: expected ${process.env.TRUSTED_RESOLVER_ADDRESS}, got ${params.resolver.toBase58()}`,
+    );
+  }
+
   const programId = requirePmammProgramId();
+  const envPid = process.env.NEXT_PUBLIC_PMAMM_PROGRAM_ID?.trim() ?? null;
   logPmammInitializeMarketClusterContext({
     programId,
     connection: params.connection,
@@ -295,8 +328,16 @@ export async function pmammBuildInitializeMarketTransaction(params: {
     programId,
   );
   const program = createPmammProgram(params.connection, params.authority);
+  console.info("[pmAMM build-init] program id alignment", {
+    NEXT_PUBLIC_PMAMM_PROGRAM_ID: envPid,
+    requirePmammProgramId: programId.toBase58(),
+    program_programId: program.programId.toBase58(),
+  });
+  const resolverPk = params.resolver;
+  // IDL `initialize_market` args order (see lib/engines/idl/pm_amm.json): market_id, end_ts, name, resolver.
+  // collateral_mint is an account, not an instruction argument.
   const ix = await program.methods
-    .initializeMarket(params.marketId, params.endTs, params.name)
+    .initializeMarket(params.marketId, params.endTs, params.name, resolverPk)
     .accounts({
       authority: params.authority,
       market: marketPda,
@@ -313,15 +354,70 @@ export async function pmammBuildInitializeMarketTransaction(params: {
     })
     .instruction();
 
-  const args = [params.marketId, params.endTs, params.name];
-  console.log({
-    args,
+  const idlForCoder: Idl = {
+    ...(pmAmmIdl as Idl),
+    address: programId.toBase58(),
+  };
+  let decodedInitializeMarketResolverArg: string | null = null;
+  try {
+    const decoded = new BorshInstructionCoder(idlForCoder).decode(
+      Buffer.from(ix.data),
+    );
+    let decodedResolverBs58: string | null = null;
+    if (decoded?.name === "initialize_market" && decoded.data && typeof decoded.data === "object") {
+      const r = (decoded.data as { resolver?: PublicKey }).resolver;
+      if (r instanceof PublicKey) {
+        decodedResolverBs58 = r.toBase58();
+      }
+    }
+    decodedInitializeMarketResolverArg = decodedResolverBs58;
+    const expectedResolverBs58 = resolverPk.toBase58();
+    console.info("[pmAMM build-init] decoded_initialize_market_instruction", {
+      program_id: programId.toBase58(),
+      decoded_name: decoded?.name ?? null,
+      decoded_args: decoded?.data ?? null,
+      decoded_resolver_arg: decodedResolverBs58,
+      expected_resolver_from_params: expectedResolverBs58,
+      decoded_resolver_matches_expected:
+        decodedResolverBs58 != null && decodedResolverBs58 === expectedResolverBs58,
+      resolver_passed_to_methods: resolverPk.toBase58(),
+    });
+    if (decodedResolverBs58 != null && decodedResolverBs58 !== expectedResolverBs58) {
+      console.error(
+        "[pmAMM build-init] decoded instruction resolver differs from params.resolver — wrong value before chain",
+        {
+          decoded_resolver_arg: decodedResolverBs58,
+          expected_resolver_from_params: expectedResolverBs58,
+        },
+      );
+      throw new Error(
+        `pmAMM init decoded resolver mismatch: expected ${expectedResolverBs58}, got ${decodedResolverBs58}`,
+      );
+    }
+  } catch (e) {
+    console.warn("[pmAMM build-init] BorshInstructionCoder.decode failed", e);
+  }
+
+  const args = [params.marketId, params.endTs, params.name, resolverPk];
+  console.info("[pmAMM build-init] instruction_arg_summary", {
+    market_id: params.marketId.toString(),
+    end_ts: params.endTs.toString(),
+    name: params.name,
+    resolver: resolverPk.toBase58(),
     argTypes: args.map((a) => typeof a),
-    isBN: args.map((a) => BNconstructor.isBN(a)),
+    marketIdIsBn: BNconstructor.isBN(params.marketId),
+    endTsIsBn: BNconstructor.isBN(params.endTs),
   });
 
   const tx = await baseTx(params.connection, params.authority, [ix]);
-  return { transaction: tx, marketPda, yesMint, noMint, vault };
+  return {
+    transaction: tx,
+    marketPda,
+    yesMint,
+    noMint,
+    vault,
+    decodedInitializeMarketResolverArg,
+  };
 }
 
 /** Engine-signed deposit after init (treasury must hold USDC). */
@@ -627,20 +723,21 @@ export async function pmammBuildWithdrawLiquidityTransaction(params: {
 
 export async function pmammBuildResolveMarketTransaction(params: {
   connection: Connection;
-  authority: PublicKey;
+  /** Must sign the tx — `market.authority` or `market.resolver` on-chain. */
+  resolverSigner: PublicKey;
   marketPda: PublicKey;
   winningSide: "yes" | "no";
 }): Promise<Transaction> {
-  const program = createPmammProgram(params.connection, params.authority);
+  const program = createPmammProgram(params.connection, params.resolverSigner);
   const side = params.winningSide === "yes" ? { yes: {} } : { no: {} };
   const ix = await program.methods
     .resolveMarket(side)
     .accounts({
-      signer: params.authority,
+      resolver: params.resolverSigner,
       market: params.marketPda,
     })
     .instruction();
-  return baseTx(params.connection, params.authority, [ix]);
+  return baseTx(params.connection, params.resolverSigner, [ix]);
 }
 
 export async function pmammBuildClaimWinningsTransaction(params: {

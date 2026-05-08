@@ -123,6 +123,12 @@ export interface Market {
   aiOverview?: string;
   /** ISO timestamp from `markets.last_stats_updated_at` (cached stats row). */
   lastStatsUpdatedAt?: string | null;
+  /** When set, feed clusters by this key (see `group-feed-markets`). */
+  eventGroupKey?: string;
+  eventTitle?: string;
+  outcomeLabel?: string;
+  outcomeType?: string;
+  groupOrder?: number;
 }
 
 export interface MarketDraft {
@@ -135,4 +141,14 @@ export interface MarketDraft {
   suggestedRules: string[];
   /** From Grok validation: what the cover image should depict. */
   imageRequirements?: string;
+  eventGroupKey?: string;
+  eventTitle?: string;
+  outcomeLabel?: string;
+  outcomeType?: string;
+  groupOrder?: number;
+  /**
+   * Populated when this outcome already exists as a live/creating market row.
+   * Create flow must skip POST /api/market/create for this draft.
+   */
+  existingSlug?: string;
 }

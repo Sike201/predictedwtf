@@ -38,4 +38,6 @@ pub enum PmAmmError {
     InsufficientVault,
     #[msg("Invalid name: must be 1-64 bytes")]
     InvalidName,
+    #[msg("Early resolve unauthorized — signer must match market authority or market.resolver")]
+    EarlyResolveUnauthorized,
 }

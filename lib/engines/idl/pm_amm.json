@@ -434,6 +434,10 @@
         {
           "name": "name",
           "type": "string"
+        },
+        {
+          "name": "resolver",
+          "type": "pubkey"
         }
       ]
     },
@@ -515,8 +519,8 @@
     {
       "name": "resolve_market",
       "docs": [
-        "Resolve the market after expiration. Authority-only.",
-        "Triggers final accrual and sets the winning side."
+        "Resolve the market. Before expiry only `market.authority` or `market.resolver` may sign;",
+        "after expiry the same authorization applies. Triggers final accrual and sets the winning side."
       ],
       "discriminator": [
         155,
@@ -530,7 +534,8 @@
       ],
       "accounts": [
         {
-          "name": "signer",
+          "name": "resolver",
+          "writable": true,
           "signer": true
         },
         {
@@ -888,6 +893,11 @@
       "code": 6016,
       "name": "InvalidName",
       "msg": "Invalid name: must be 1-64 bytes"
+    },
+    {
+      "code": 6017,
+      "name": "EarlyResolveUnauthorized",
+      "msg": "Early resolve unauthorized — signer must match market authority or market.resolver"
     }
   ],
   "types": [
@@ -1045,11 +1055,41 @@
             "type": "u8"
           },
           {
+            "name": "layout_version",
+            "docs": [
+              "Schema version for off-chain / tooling. `2` = `resolver` before `name` (this field order)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "resolver",
+            "docs": [
+              "Dedicated early resolver (e.g. trusted oracle wallet). `Pubkey::default()` means",
+              "“unset” for legacy accounts; treat as authority-only for off-chain matching.",
+              "",
+              "**Must come before `name`:** Anchor account serialization omits trailing fields after",
+              "certain layouts; `resolver` after `name` was not persisted (account tail stayed zero)."
+            ],
+            "type": "pubkey"
+          },
+          {
             "name": "name",
             "type": {
               "array": [
                 "u8",
                 64
+              ]
+            }
+          },
+          {
+            "name": "reserved",
+            "docs": [
+              "Trailing reserved bytes (legacy sizing — zeroed on init)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
               ]
             }
           }

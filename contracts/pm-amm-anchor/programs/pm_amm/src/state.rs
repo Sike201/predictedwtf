@@ -55,8 +55,21 @@ pub struct Market {
 
     pub bump: u8,
 
+    /// Schema version for off-chain / tooling. `2` = `resolver` before `name` (this field order).
+    pub layout_version: u8,
+
+    /// Dedicated early resolver (e.g. trusted oracle wallet). `Pubkey::default()` means
+    /// “unset” for legacy accounts; treat as authority-only for off-chain matching.
+    ///
+    /// **Must come before `name`:** Anchor account serialization omits trailing fields after
+    /// certain layouts; `resolver` after `name` was not persisted (account tail stayed zero).
+    pub resolver: Pubkey,
+
     // Market name (UTF-8, zero-padded)
     pub name: [u8; 64],
+
+    /// Trailing reserved bytes (legacy sizing — zeroed on init).
+    pub reserved: [u8; 32],
 }
 
 impl Market {
@@ -84,8 +97,10 @@ impl Market {
         + 1  // resolved
         + 1  // winning_side
         + 1  // bump
+        + 1  // layout_version
+        + 32 // resolver (before `name` so Anchor serializes it)
         + 64 // name
-        + 64; // padding
+        + 32; // reserved tail
 
     // --- Q64.64 helpers ---
 
@@ -215,7 +230,10 @@ mod tests {
             resolved: false,
             winning_side: 0,
             bump: 0,
+            layout_version: 2,
+            resolver: Pubkey::default(),
             name: [0u8; 64],
+            reserved: [0u8; 32],
         };
 
         // Test various values round-trip through u128 storage
@@ -241,6 +259,88 @@ mod tests {
     }
 
     #[test]
+    fn market_rust_size_vs_serialized_len() {
+        use anchor_lang::AnchorSerialize;
+        use std::mem::size_of;
+        let m = Market {
+            authority: Pubkey::default(),
+            market_id: 0,
+            collateral_mint: Pubkey::default(),
+            yes_mint: Pubkey::default(),
+            no_mint: Pubkey::default(),
+            vault: Pubkey::default(),
+            start_ts: 0,
+            end_ts: 0,
+            l_zero: 0,
+            reserve_yes: 0,
+            reserve_no: 0,
+            last_accrual_ts: 0,
+            cum_yes_per_share: 0,
+            cum_no_per_share: 0,
+            total_yes_distributed: 0,
+            total_no_distributed: 0,
+            total_lp_shares: 0,
+            resolved: false,
+            winning_side: 0,
+            bump: 0,
+            layout_version: 2,
+            resolver: Pubkey::default(),
+            name: [0u8; 64],
+            reserved: [0u8; 32],
+        };
+        let mut buf = Vec::new();
+        m.serialize(&mut buf).unwrap();
+        eprintln!("size_of Market = {}", size_of::<Market>());
+        eprintln!("anchor_serialized len = {}", buf.len());
+        eprintln!("Market::LEN - 8 = {}", Market::LEN - 8);
+    }
+
+    #[test]
+    fn market_anchor_serialize_includes_resolver_before_name() {
+        use anchor_lang::AnchorSerialize;
+        let resolver = Pubkey::new_from_array([9u8; 32]);
+        let m = Market {
+            authority: Pubkey::new_from_array([1u8; 32]),
+            market_id: 42,
+            collateral_mint: Pubkey::new_from_array([2u8; 32]),
+            yes_mint: Pubkey::new_from_array([3u8; 32]),
+            no_mint: Pubkey::new_from_array([4u8; 32]),
+            vault: Pubkey::new_from_array([5u8; 32]),
+            start_ts: 1,
+            end_ts: 2,
+            l_zero: 0,
+            reserve_yes: 0,
+            reserve_no: 0,
+            last_accrual_ts: 0,
+            cum_yes_per_share: 0,
+            cum_no_per_share: 0,
+            total_yes_distributed: 0,
+            total_no_distributed: 0,
+            total_lp_shares: 0,
+            resolved: false,
+            winning_side: 0,
+            bump: 0,
+            layout_version: 2,
+            resolver,
+            name: [0u8; 64],
+            reserved: [0u8; 32],
+        };
+        let mut buf = Vec::new();
+        m.serialize(&mut buf).unwrap();
+        assert_eq!(
+            buf.len(),
+            Market::LEN - 8,
+            "serialized market body should match LEN minus 8-byte account discriminator"
+        );
+        // Byte offset of `resolver` in serialized account body (after 8-byte disc), borsh order.
+        const RESOLVER_BODY_OFFSET: usize = 308;
+        let got: [u8; 32] = buf[RESOLVER_BODY_OFFSET..RESOLVER_BODY_OFFSET + 32]
+            .try_into()
+            .unwrap();
+        assert_eq!(Pubkey::new_from_array(got), resolver);
+    }
+
+    #[test]
     fn test_winning_side() {
         let mut market = Market {
             authority: Pubkey::default(),
@@ -263,7 +363,10 @@ mod tests {
             resolved: false,
             winning_side: 0,
             bump: 0,
+            layout_version: 2,
+            resolver: Pubkey::default(),
             name: [0u8; 64],
+            reserved: [0u8; 32],
         };
 
         assert_eq!(market.get_winning_side(), None);

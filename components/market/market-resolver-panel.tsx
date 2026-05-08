@@ -29,6 +29,8 @@ export function MarketResolverPanel({ market }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const connectedWallet = publicKey?.toBase58() ?? null;
+  const canResolve = isTrustedResolverConnected(connected, publicKey);
 
   useEffect(() => {
     if (process.env.NODE_ENV !== "development") return;
@@ -44,13 +46,23 @@ export function MarketResolverPanel({ market }: Props) {
     );
   }, [market.id, market.phase, market.resolution.status]);
 
+  useEffect(() => {
+    if (process.env.NODE_ENV !== "development") return;
+    console.info("[predicted][resolver-ui-debug]", {
+      connectedWallet,
+      marketResolverWallet: market.resolution.resolverWallet,
+      trustedResolverEnv: TRUSTED_RESOLVER_ADDRESS,
+      canResolve,
+    });
+  }, [canResolve, connectedWallet, market.resolution.resolverWallet]);
+
   const onResolve = useCallback(async () => {
     setError(null);
     if (market.resolution.status === "resolved") {
       setError("Already resolved.");
       return;
     }
-    if (!isTrustedResolverConnected(connected, publicKey)) {
+    if (!canResolve) {
       return;
     }
     if (!signMessage) {
@@ -101,6 +113,7 @@ export function MarketResolverPanel({ market }: Props) {
     }
   }, [
     connected,
+    canResolve,
     publicKey,
     market.id,
     market.resolution.status,
@@ -117,7 +130,7 @@ export function MarketResolverPanel({ market }: Props) {
     return null;
   }
 
-  if (!isTrustedResolverConnected(connected, publicKey)) {
+  if (!canResolve) {
     return null;
   }
 
@@ -137,12 +150,13 @@ export function MarketResolverPanel({ market }: Props) {
         Set outcome
       </h3>
       <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
-        You may post the final result for this market. Sign the resolution
-        message with the configured resolver key.
+        Post the final result when ready. You can settle before the scheduled
+        end time; the on-chain market authority must match the server signer.
+        Sign the resolution message with the configured resolver key.
       </p>
       {Number.isFinite(Date.parse(market.resolution.resolveAfter)) ? (
         <p className="mt-1.5 text-[10px] text-zinc-600">
-          Scheduled market end (informational):{" "}
+          Scheduled end (informational — early resolution is allowed):{" "}
           {new Date(market.resolution.resolveAfter).toLocaleString()}
         </p>
       ) : null}
@@ -180,10 +194,7 @@ export function MarketResolverPanel({ market }: Props) {
 
       <button
         type="button"
-        disabled={
-          busy ||
-          market.resolution.resolverWallet !== TRUSTED_RESOLVER_ADDRESS
-        }
+        disabled={busy}
         onClick={() => {
           void onResolve();
         }}

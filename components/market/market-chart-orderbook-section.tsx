@@ -106,6 +106,8 @@ type Props = {
   oneSidedLiquidity?: boolean;
   /** Bumps when pool RPC read succeeds — recomputes live tail timestamp. */
   liveRefreshEpoch?: number;
+  /** Grouped events: show outcome name in chart hover tooltip. */
+  chartTooltipSubtitle?: string | null;
 };
 
 export function MarketChartOrderbookSection({
@@ -118,6 +120,7 @@ export function MarketChartOrderbookSection({
   livePriceUnavailable,
   oneSidedLiquidity,
   liveRefreshEpoch = 0,
+  chartTooltipSubtitle,
 }: Props) {
   const sectionMountPerfRef = useRef<number | null>(null);
   useLayoutEffect(() => {
@@ -811,6 +814,7 @@ export function MarketChartOrderbookSection({
                   xDomain={chartPathPrep.xDomain}
                   xTickCount={chartPathPrep.xTickCount}
                   drawEpoch={chartDrawEpoch}
+                  tooltipSubtitle={chartTooltipSubtitle}
                 />
               ) : null}
             </div>

@@ -54,15 +54,19 @@ export async function POST(req: Request) {
         stage: result.stage,
         missingProgramId: result.missingProgramId,
       });
-      return NextResponse.json(
-        {
-          error: result.error,
-          stage: result.stage,
-          missingProgramId: result.missingProgramId,
-          outcomeAtaContext: result.outcomeAtaContext,
-        },
-        { status: 502 },
-      );
+      const body: Record<string, unknown> = {
+        error: result.error,
+        stage: result.stage,
+        missingProgramId: result.missingProgramId,
+        outcomeAtaContext: result.outcomeAtaContext,
+      };
+      if (
+        process.env.NODE_ENV === "development" &&
+        result.pmammResolverDebug
+      ) {
+        body.pmammResolverDebug = result.pmammResolverDebug;
+      }
+      return NextResponse.json(body, { status: 502 });
     }
 
     if (result.pmammAwaitingUserDeposit) {
@@ -84,7 +88,10 @@ export async function POST(req: Request) {
     } else {
       console.info("[predicted][api/create] success", { slug: result.market.slug });
     }
-    return NextResponse.json({ market: result.market });
+    return NextResponse.json({
+      market: result.market,
+      reusedExisting: Boolean(result.reusedExisting),
+    });
   } catch (e) {
     const message = e instanceof Error ? e.message : "Create market failed";
     console.error("[predicted][api/create] exception", e);

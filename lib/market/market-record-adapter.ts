@@ -5,6 +5,7 @@ import {
 } from "@/lib/market/market-lifecycle";
 import { pickActiveResolveOrExpiryRaw, parseResolveAfterEpochMs } from "@/lib/market/utc-instant";
 import { marketCoverImageUrlFromStored } from "@/lib/storage/pinata";
+import { normalizeStoredGroupKey } from "@/lib/market/group-feed-markets";
 import type { MarketRecord } from "@/lib/types/market-record";
 import type {
   Market,
@@ -151,6 +152,18 @@ export function marketRecordToMarket(record: MarketRecord, layoutIndex = 0): Mar
     views: 0,
     aiOverview: undefined,
     lastStatsUpdatedAt: record.last_stats_updated_at ?? null,
+    ...(record.event_group_key?.trim()
+      ? {
+          eventGroupKey: normalizeStoredGroupKey(record.event_group_key.trim()),
+          eventTitle: record.event_title?.trim() || undefined,
+          outcomeLabel: record.outcome_label?.trim() || undefined,
+          outcomeType: record.outcome_type?.trim() || undefined,
+          groupOrder:
+            typeof record.group_order === "number"
+              ? record.group_order
+              : undefined,
+        }
+      : {}),
   };
 
   return m;

@@ -1,5 +1,6 @@
 import {
   Connection,
+  Keypair,
   PublicKey,
   SystemProgram,
   type Transaction,
@@ -7,6 +8,7 @@ import {
 
 import { createPmammProgram } from "@/lib/solana/pmamm-program";
 import { getPmammCollateralMint } from "@/lib/solana/pmamm-config";
+import { TRUSTED_RESOLVER_ADDRESS } from "@/lib/market/trusted-resolver";
 import type { GetPmammMarketAddressOk } from "@/lib/solana/pmamm-market-address-from-row";
 
 export const PMAMM_RESOLVE_ERROR_CODE = {
@@ -39,6 +41,8 @@ export type ValidatePmammMarketResolveResult =
       ok: true;
       warnings: string[];
       authority: PublicKey | null;
+      resolver: PublicKey | null;
+      endTs: bigint;
     }
   | {
       ok: false;
@@ -87,9 +91,11 @@ export async function validatePmammMarketAccountBeforeResolve(
   try {
     type MarketAcc = {
       authority: PublicKey;
+      resolver: PublicKey;
       collateralMint: PublicKey;
       yesMint: PublicKey;
       noMint: PublicKey;
+      endTs: { toString: () => string };
     };
     const fetched = await (
       program as unknown as {
@@ -109,6 +115,7 @@ export async function validatePmammMarketAccountBeforeResolve(
     }
 
     let authority: PublicKey | null = fetched.authority ?? null;
+    const resolver: PublicKey | null = fetched.resolver ?? null;
 
     const yesDb = trimPk(ctx.supabaseSnapshot.yes_mint);
     const noDb = trimPk(ctx.supabaseSnapshot.no_mint);
@@ -161,7 +168,13 @@ export async function validatePmammMarketAccountBeforeResolve(
       );
     }
 
-    return { ok: true, warnings, authority };
+    return {
+      ok: true,
+      warnings,
+      authority,
+      resolver,
+      endTs: BigInt(fetched.endTs.toString()),
+    };
   } catch (e) {
     const basis = e instanceof Error ? e.message : String(e);
     let discriminatorReceivedHex: string | undefined;
@@ -186,6 +199,66 @@ export async function validatePmammMarketAccountBeforeResolve(
   }
 }
 
+/** Choose which server keypair may sign `resolve_market` for this market account. */
+export function pickPmammResolveServerSigner(params: {
+  treasury: Keypair;
+  trusted: Keypair | null;
+  marketAuthority: PublicKey;
+  marketResolver: PublicKey | null;
+}):
+  | { ok: true; signer: Keypair; label: string }
+  | { ok: false; detail: string } {
+  const { treasury, trusted, marketAuthority } = params;
+  const chainResolver = params.marketResolver;
+  const resolverUnset =
+    !chainResolver || chainResolver.equals(PublicKey.default);
+
+  const chainResolverBs58 = resolverUnset ? null : chainResolver!.toBase58();
+  const marketUsesTrustedResolverWallet =
+    !resolverUnset && chainResolverBs58 === TRUSTED_RESOLVER_ADDRESS;
+
+  if (marketUsesTrustedResolverWallet && !trusted) {
+    return {
+      ok: false,
+      detail: `market.resolver is the trusted resolver (${TRUSTED_RESOLVER_ADDRESS}) but TRUSTED_RESOLVER_SECRET is missing or failed validation — loadTrustedResolverSigner() returned null.`,
+    };
+  }
+
+  if (!resolverUnset && trusted && trusted.publicKey.equals(chainResolver!)) {
+    return {
+      ok: true,
+      signer: trusted,
+      label: "TRUSTED_RESOLVER_SECRET matches on-chain market.resolver",
+    };
+  }
+  if (treasury.publicKey.equals(marketAuthority)) {
+    return {
+      ok: true,
+      signer: treasury,
+      label: "MARKET_ENGINE_AUTHORITY_SECRET matches market.authority",
+    };
+  }
+  if (!resolverUnset && treasury.publicKey.equals(chainResolver)) {
+    return {
+      ok: true,
+      signer: treasury,
+      label: "MARKET_ENGINE_AUTHORITY_SECRET matches market.resolver",
+    };
+  }
+  if (trusted && trusted.publicKey.equals(marketAuthority)) {
+    return {
+      ok: true,
+      signer: trusted,
+      label: "TRUSTED_RESOLVER_SECRET matches market.authority",
+    };
+  }
+
+  return {
+    ok: false,
+    detail: `No server keypair authorized for resolve_market. treasury=${treasury.publicKey.toBase58()} trusted_loaded=${trusted ? trusted.publicKey.toBase58() : "none"} market.authority=${marketAuthority.toBase58()} market.resolver=${resolverUnset ? "(unset/zero)" : chainResolver!.toBase58()}`,
+  };
+}
+
 export function friendlyMessageForPmammResolveRpcFailure(raw: string): string {
   const trimmed = raw.trim();
   if (/AccountNotFound/i.test(trimmed)) {
@@ -196,6 +269,12 @@ export function friendlyMessageForPmammResolveRpcFailure(raw: string): string {
   }
   if (/already been processed|AlreadyProcessed/i.test(trimmed)) {
     return "Transaction duplicate — retry with a fresh blockhash if needed.";
+  }
+  if (/EarlyResolveUnauthorized/i.test(trimmed)) {
+    return "On-chain resolve rejected: early resolve unauthorized (signer must match market authority or market.resolver — check server logs for pubkey alignment).";
+  }
+  if (/MarketNotExpired/i.test(trimmed)) {
+    return "On-chain resolve rejected: market not expired and signer is not authorized for early resolution.";
   }
   return trimmed;
 }

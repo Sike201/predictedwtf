@@ -29,8 +29,48 @@ import {
   PMAMM_CONFIG,
   PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN,
 } from "@/lib/solana/pmamm-config";
+import {
+  dedupeWinnerDrafts,
+  isNoneOfListedOutcomeDraft,
+} from "@/lib/market/group-feed-markets";
+import { reconcileGroupedDraftOutcomeMutations } from "@/lib/market/draft-outcome-reconcile";
+import {
+  alignGroupDraftExpiries,
+  evaluateBundleCreateReadiness,
+} from "@/lib/market/draft-create-readiness";
+import type { GroupReconciliationPayload } from "@/lib/market/grouped-market-merge";
 
 const PMAMM_USDC_DECIMALS = 6;
+
+/** Canonical draft for the create UI: `drafts` lists only markets that still need POST /create after DB reconciliation. */
+type MarketBundle = {
+  eventTitle: string | null;
+  drafts: MarketDraft[];
+  groupReconciliation?: GroupReconciliationPayload | null;
+};
+
+function logDraftMutation(params: {
+  intent: string;
+  target?: string;
+  beforeCount: number;
+  afterCount: number;
+  beforeQuestions: string[];
+  afterQuestions: string[];
+}) {
+  console.info("[draft-mutation]", JSON.stringify(params));
+}
+
+function imageValidationFocusQuestion(
+  bundle: MarketBundle | null,
+  d: MarketDraft,
+): string {
+  if (!bundle || bundle.drafts.length <= 1) {
+    return d.question;
+  }
+  return [bundle.eventTitle, ...bundle.drafts.map((x) => x.question)]
+    .filter(Boolean)
+    .join(" · ");
+}
 
 type ChatMsg = { role: "user" | "assistant"; text: string };
 
@@ -68,7 +108,7 @@ function PremiumThinking() {
         transition={{ type: "spring", stiffness: 420, damping: 36 }}
         className="flex items-center gap-2 rounded-[1.25rem] rounded-bl-md border border-white/[0.09] bg-gradient-to-r from-white/[0.06] to-white/[0.03] px-4 py-3"
       >
-        <span className="text-[12px] text-zinc-400">Grok is checking</span>
+        <span className="text-[12px] text-zinc-400">One sec…</span>
         <span className="flex gap-1">
           {[0, 1, 2].map((i) => (
             <motion.span
@@ -93,14 +133,21 @@ function Composer({
   input,
   setInput,
   busy,
-  draft,
+  submitLocked,
+  hasDraft,
   onSend,
+  placeholderHint,
 }: {
   input: string;
   setInput: (v: string) => void;
   busy: boolean;
-  draft: MarketDraft | null;
+  /** True while assistant responds or submission is in flight (disables chat). */
+  submitLocked: boolean;
+  /** A draft is on-screen — adjust placeholder only. */
+  hasDraft: boolean;
   onSend: () => void;
+  /** When set (e.g. mid-chat before a draft), overrides default placeholder. */
+  placeholderHint?: string;
 }) {
   return (
     <motion.div
@@ -120,7 +167,7 @@ function Composer({
       <div
         className={cn(
           "flex items-center gap-2 rounded-full border border-white/[0.12] bg-white/[0.06] py-2 pl-4 pr-2 shadow-[inset_0_1px_10px_rgba(0,0,0,0.35)] transition focus-within:border-white/[0.18] focus-within:bg-white/[0.08]",
-          draft && "opacity-40",
+          submitLocked && "opacity-40",
         )}
       >
         <input
@@ -131,14 +178,16 @@ function Composer({
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
-              if (!busy && !draft && input.trim()) onSend();
+              if (!submitLocked && input.trim()) onSend();
             }
           }}
           placeholder={
-            draft ? "Review and add an image above…" : INPUT_PLACEHOLDER
+            hasDraft
+              ? "Change expiry, wording, add/remove outcomes, engine…"
+              : (placeholderHint ?? INPUT_PLACEHOLDER)
           }
           autoComplete="off"
-          disabled={busy || !!draft}
+          disabled={submitLocked}
           className="min-h-[44px] min-w-0 flex-1 border-0 bg-transparent text-[13px] text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-0 disabled:cursor-not-allowed"
         />
         {busy ? (
@@ -151,9 +200,9 @@ function Composer({
         ) : (
           <motion.button
             type="button"
-            whileHover={{ scale: draft ? 1 : 1.04 }}
-            whileTap={{ scale: draft ? 1 : 0.96 }}
-            disabled={!input.trim() || !!draft}
+            whileHover={{ scale: submitLocked ? 1 : 1.04 }}
+            whileTap={{ scale: submitLocked ? 1 : 0.96 }}
+            disabled={!input.trim() || submitLocked}
             onClick={onSend}
             aria-label="Send"
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-white/[0.14] text-white transition hover:bg-white/[0.22] disabled:cursor-not-allowed disabled:opacity-35"
@@ -198,7 +247,8 @@ export function CreateMarketFlow() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [messages, setMessages] = useState<ChatMsg[]>([]);
-  const [draft, setDraft] = useState<MarketDraft | null>(null);
+  const [marketBundle, setMarketBundle] = useState<MarketBundle | null>(null);
+  const [batchCreatedSlugs, setBatchCreatedSlugs] = useState<string[]>([]);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [imageRelated, setImageRelated] = useState<boolean | null>(null);
   const [imageReason, setImageReason] = useState("");
@@ -225,6 +275,28 @@ export function CreateMarketFlow() {
   } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastObjectUrl = useRef<string | null>(null);
+  const primaryDraft = marketBundle?.drafts[0] ?? null;
+  const draftCount = marketBundle?.drafts.length ?? 0;
+  const pendingCreateCount = draftCount;
+  const hasBundle =
+    draftCount > 0 || Boolean(marketBundle?.groupReconciliation);
+  const submitLocked = busy || creatingMarket;
+  const bundleReadiness = useMemo(() => {
+    const d = marketBundle?.drafts ?? [];
+    const rec = marketBundle?.groupReconciliation;
+    if (
+      d.length === 0 &&
+      rec &&
+      rec.newOutcomeLabels.length === 0 &&
+      rec.existingOutcomeLabels.length > 0
+    ) {
+      return {
+        canCreate: false,
+        blockedHint: "All outcomes already exist for this event.",
+      };
+    }
+    return evaluateBundleCreateReadiness(d);
+  }, [marketBundle]);
   const createSuccessNavTimer = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -234,7 +306,7 @@ export function CreateMarketFlow() {
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [messages, busy, draft, imageChecking, creatingMarket]);
+  }, [messages, busy, hasBundle, imageChecking, creatingMarket, draftCount]);
 
   function reset() {
     if (lastObjectUrl.current) {
@@ -244,7 +316,8 @@ export function CreateMarketFlow() {
     setInput("");
     setBusy(false);
     setMessages([]);
-    setDraft(null);
+    setMarketBundle(null);
+    setBatchCreatedSlugs([]);
     setImagePreview(null);
     setImageRelated(null);
     setImageReason("");
@@ -280,12 +353,17 @@ export function CreateMarketFlow() {
         publicKey?.toBase58(),
       );
     }
-    router.push(`/markets/${encodeURIComponent(marketCreated.slug)}`);
+    const slug =
+      batchCreatedSlugs.length > 0 ? batchCreatedSlugs[0]! : marketCreated.slug;
+    router.push(`/markets/${encodeURIComponent(slug)}`);
   }
 
-  /** After a successful create, show success UI briefly then open the new market. */
+  /** After a successful create, auto-open the market when only one was part of the flow. */
   useEffect(() => {
     if (!marketCreated) return;
+    if (batchCreatedSlugs.length > 1) {
+      return;
+    }
     const m = marketCreated;
     createSuccessNavTimer.current = setTimeout(() => {
       createSuccessNavTimer.current = null;
@@ -309,7 +387,7 @@ export function CreateMarketFlow() {
         createSuccessNavTimer.current = null;
       }
     };
-  }, [marketCreated, publicKey, router]);
+  }, [marketCreated, batchCreatedSlugs.length, publicKey, router]);
 
   const pmammLiqParsed = useMemo(() => {
     if (marketEngine !== "PM_AMM") {
@@ -363,7 +441,8 @@ export function CreateMarketFlow() {
     marketEngine !== "PM_AMM" || (!!signTransaction && !!connection);
 
   const formReady =
-    draft != null &&
+    bundleReadiness.canCreate &&
+    primaryDraft != null &&
     imagePreview != null &&
     imageRelated === true &&
     !imageChecking &&
@@ -373,7 +452,10 @@ export function CreateMarketFlow() {
     pmammCanSign;
 
   const createBlockedReason = (() => {
-    if (!draft) return null;
+    if (!bundleReadiness.canCreate && bundleReadiness.blockedHint) {
+      return bundleReadiness.blockedHint;
+    }
+    if (!primaryDraft) return null;
     if (!connected || !publicKey) {
       return "Connect wallet to create a market.";
     }
@@ -395,18 +477,26 @@ export function CreateMarketFlow() {
     return null;
   })();
 
-  async function handleCreateMarket() {
-    if (!draft || !publicKey || creatingMarket) {
-      console.info("[predicted][create-ui] create market skipped (guard)", {
-        hasDraft: Boolean(draft),
-        hasPublicKey: Boolean(publicKey),
-        creatingMarket,
-      });
-      return;
+  async function runCreateForDraft(
+    forDraft: MarketDraft,
+  ): Promise<
+    | {
+        ok: true;
+        slug: string;
+        primarySig: string | null;
+        mintYesTx: string | null;
+        mintNoTx: string | null;
+        poolInitTx: string | null;
+        seedLiquidityTx: string | null;
+      }
+    | { ok: false; message: string }
+  > {
+    if (!publicKey) {
+      return { ok: false, message: "Connect wallet to create a market." };
     }
 
     const payload = {
-      draft,
+      draft: forDraft,
       creatorWallet: publicKey.toBase58(),
       imageDataUrl: coverDataUrl ?? undefined,
       engine: marketEngine,
@@ -414,29 +504,7 @@ export function CreateMarketFlow() {
         ? { initialLiquidityUsdc: pmammInitialLiquidityUsdc.trim() }
         : {}),
     };
-    console.info("[predicted][create-ui] create market clicked", {
-        hasDraft: true,
-        creatorWallet: publicKey.toBase58(),
-        marketEngine,
-        initialLiquidityUsdc:
-          marketEngine === "PM_AMM"
-            ? pmammInitialLiquidityUsdc.trim()
-            : undefined,
-        hasImageDataUrl: Boolean(coverDataUrl),
-        imageDataUrlBytes:
-          coverDataUrl != null
-            ? Math.ceil((coverDataUrl.length * 3) / 4)
-            : 0,
-        formReady,
-        draftSummary: {
-          question: draft.question?.slice(0, 80),
-          resolutionRules: draft.resolutionRules?.slice(0, 200),
-          hasExpiry: Boolean(draft.expiry?.trim?.()),
-        },
-        imageState: { imagePreview: Boolean(imagePreview), imageRelated, imageChecking },
-      });
 
-    setCreatingMarket(true);
     try {
       const res = await fetch("/api/market/create", {
         method: "POST",
@@ -444,11 +512,6 @@ export function CreateMarketFlow() {
         body: JSON.stringify(payload),
       });
       const rawText = await res.text();
-      console.info("[predicted][create-ui] create API response", {
-        status: res.status,
-        ok: res.ok,
-        bodyPreview: rawText.slice(0, 2000),
-      });
       let json: {
         market?: MarketRecord;
         error?: string;
@@ -458,19 +521,11 @@ export function CreateMarketFlow() {
       } = {};
       try {
         json = (rawText ? JSON.parse(rawText) : {}) as typeof json;
-      } catch (parseErr) {
-        console.error("[predicted][create-ui] create API: JSON parse error", {
-            parseErr,
-            rawText: rawText.slice(0, 500),
-          });
-        setMessages((m) => [
-          ...m,
-          {
-            role: "assistant",
-            text: `Create market failed: server returned non-JSON (HTTP ${res.status}). ${rawText.slice(0, 200)}`,
-          },
-        ]);
-        return;
+      } catch {
+        return {
+          ok: false,
+          message: `Create market failed: server returned non-JSON (HTTP ${res.status}). ${rawText.slice(0, 200)}`,
+        };
       }
       if (!res.ok) {
         const detail = [
@@ -482,20 +537,12 @@ export function CreateMarketFlow() {
         ]
           .filter(Boolean)
           .join("\n");
-        console.error("[predicted][create-ui] create API error", {
-            status: res.status,
-            ...json,
-          });
-        setMessages((m) => [
-          ...m,
-          {
-            role: "assistant",
-            text:
-              detail ||
-              "Could not create this market. Try again or check configuration.",
-          },
-        ]);
-        return;
+        return {
+          ok: false,
+          message:
+            detail ||
+            "Could not create this market. Try again or check configuration.",
+        };
       }
 
       const phase = (json as { phase?: string }).phase;
@@ -509,14 +556,11 @@ export function CreateMarketFlow() {
         json.market?.slug
       ) {
         if (!signTransaction || !connection) {
-          setMessages((m) => [
-            ...m,
-            {
-              role: "assistant",
-              text: "Cannot sign the liquidity deposit — use a wallet that supports signing transactions.",
-            },
-          ]);
-          return;
+          return {
+            ok: false,
+            message:
+              "Cannot sign the liquidity deposit — use a wallet that supports signing transactions.",
+          };
         }
         try {
           const tx = Transaction.from(Buffer.from(depositB64, "base64"));
@@ -549,14 +593,10 @@ export function CreateMarketFlow() {
               completeText ? JSON.parse(completeText) : {}
             ) as typeof completeJson;
           } catch {
-            setMessages((m) => [
-              ...m,
-              {
-                role: "assistant",
-                text: `Deposit submitted (${depositSig.slice(0, 12)}…) but finalize response was invalid. Check your market or try again.`,
-              },
-            ]);
-            return;
+            return {
+              ok: false,
+              message: `Deposit submitted (${depositSig.slice(0, 12)}…) but finalize response was invalid. Check your market or try again.`,
+            };
           }
           if (!completeRes.ok) {
             const detail = [
@@ -565,104 +605,125 @@ export function CreateMarketFlow() {
             ]
               .filter(Boolean)
               .join("\n");
-            setMessages((m) => [
-              ...m,
-              {
-                role: "assistant",
-                text:
-                  detail ||
-                  "Could not finalize the market after your deposit. Check devnet and try again.",
-              },
-            ]);
-            return;
+            return {
+              ok: false,
+              message:
+                detail ||
+                "Could not finalize the market after your deposit. Check devnet and try again.",
+            };
           }
           const final = completeJson.market;
           if (!final?.slug) {
-            setMessages((m) => [
-              ...m,
-              {
-                role: "assistant",
-                text: "Finalize step returned no market. Check server logs.",
-              },
-            ]);
-            return;
+            return {
+              ok: false,
+              message: "Finalize step returned no market. Check server logs.",
+            };
           }
           const primarySig =
             final.seed_liquidity_tx ??
             final.pool_init_tx ??
             final.created_tx ??
             null;
-          console.info("[predicted][create-ui] pmAMM create complete", {
-            slug: final.slug,
-            depositSig,
-            primarySig,
-          });
-          setMarketCreated({
+          return {
+            ok: true,
             slug: final.slug,
             primarySig,
             mintYesTx: final.mint_yes_tx ?? null,
             mintNoTx: final.mint_no_tx ?? null,
             poolInitTx: final.pool_init_tx ?? null,
             seedLiquidityTx: final.seed_liquidity_tx ?? null,
-          });
+          };
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
-          console.error(
-            "[predicted][create-ui] pmAMM deposit sign/send failed",
-            e,
-          );
-          setMessages((m) => [
-            ...m,
-            {
-              role: "assistant",
-              text: `Liquidity deposit failed: ${errMsg || "Wallet or network error"}.`,
-            },
-          ]);
+          return {
+            ok: false,
+            message: `Liquidity deposit failed: ${errMsg || "Wallet or network error"}.`,
+          };
         }
-        return;
       }
 
       if (json.market?.slug) {
         const m = json.market;
+        if ((json as { reusedExisting?: boolean }).reusedExisting) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "assistant",
+              text: "That market already exists — opening it.",
+            },
+          ]);
+        }
         const primarySig =
           m.created_tx ?? m.pool_init_tx ?? m.mint_yes_tx ?? null;
-        console.info("[predicted][create-ui] create market success", {
-            slug: m.slug,
-            primarySig,
-            pool_init_tx: m.pool_init_tx,
-            created_tx: m.created_tx,
-          });
-        setMarketCreated({
+        return {
+          ok: true,
           slug: m.slug,
           primarySig,
           mintYesTx: m.mint_yes_tx ?? null,
           mintNoTx: m.mint_no_tx ?? null,
           poolInitTx: m.pool_init_tx ?? null,
           seedLiquidityTx: m.seed_liquidity_tx ?? null,
-        });
-        return;
+        };
       }
-      console.error(
-          "[predicted][create-ui] create API: ok but no market.slug in body",
-          json,
-        );
-      setMessages((m) => [
-        ...m,
-        {
-          role: "assistant",
-          text: `Create market returned an unexpected response (no market slug). Check server logs. Body: ${rawText.slice(0, 400)}`,
-        },
-      ]);
+
+      return {
+        ok: false,
+        message: `Create market returned an unexpected response (no market slug). Body: ${rawText.slice(0, 400)}`,
+      };
     } catch (e: unknown) {
       const errMsg = e instanceof Error ? e.message : String(e);
-      console.error("[predicted][create-ui] create market client exception", e);
-      setMessages((m) => [
-        ...m,
-        {
-          role: "assistant",
-          text: `Create market failed: ${errMsg || "Network error"}`,
-        },
-      ]);
+      return {
+        ok: false,
+        message: `Create market failed: ${errMsg || "Network error"}`,
+      };
+    }
+  }
+
+  async function handleCreateMarket() {
+    if (!marketBundle?.drafts.length || !publicKey || creatingMarket) {
+      return;
+    }
+
+    console.info("[predicted][create-ui] create market(s) clicked", {
+      count: pendingCreateCount,
+      draftsListed: marketBundle.drafts.length,
+      creatorWallet: publicKey.toBase58(),
+      marketEngine,
+    });
+
+    setCreatingMarket(true);
+    try {
+      const slugs: string[] = [];
+      let lastRecord: {
+        slug: string;
+        primarySig: string | null;
+        mintYesTx: string | null;
+        mintNoTx: string | null;
+        poolInitTx: string | null;
+        seedLiquidityTx: string | null;
+      } | null = null;
+
+      for (const forDraft of marketBundle.drafts) {
+        const r = await runCreateForDraft(forDraft);
+        if (!r.ok) {
+          setMessages((m) => [...m, { role: "assistant", text: r.message }]);
+          return;
+        }
+        slugs.push(r.slug);
+        lastRecord = {
+          slug: r.slug,
+          primarySig: r.primarySig,
+          mintYesTx: r.mintYesTx,
+          mintNoTx: r.mintNoTx,
+          poolInitTx: r.poolInitTx,
+          seedLiquidityTx: r.seedLiquidityTx,
+        };
+      }
+
+      if (lastRecord) {
+        setBatchCreatedSlugs(slugs);
+        setMarketCreated(lastRecord);
+      }
     } finally {
       setCreatingMarket(false);
     }
@@ -692,10 +753,12 @@ export function CreateMarketFlow() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           imageDataUrl: dataUrl,
-          question: d.question,
+          question: imageValidationFocusQuestion(marketBundle, d),
           description: d.description,
           imageRequirements: d.imageRequirements ?? "",
-          subject: d.imageRequirements?.trim() || d.question,
+          subject:
+            d.imageRequirements?.trim() ||
+            imageValidationFocusQuestion(marketBundle, d),
         }),
       });
       const json = (await res.json()) as {
@@ -730,7 +793,14 @@ export function CreateMarketFlow() {
 
   async function handleSend() {
     const text = input.trim();
-    if (!text || busy || draft) return;
+    if (!text || submitLocked) return;
+    const startOver = /^(start\s+over|new\s+market|reset|discard\s+draft)\b/i.test(
+      text,
+    );
+    const priorHistory = messages.map((m) => ({
+      role: m.role,
+      content: m.text,
+    }));
     setMessages((m) => [...m, { role: "user", text }]);
     setInput("");
     setBusy(true);
@@ -739,13 +809,29 @@ export function CreateMarketFlow() {
       const res = await fetch("/api/market/validate-prompt", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: text }),
+        body: JSON.stringify({
+          prompt: text,
+          history: priorHistory,
+          userDisplayHint: publicKey
+            ? `wallet ${publicKey.toBase58()}`
+            : undefined,
+          existingDrafts:
+            !startOver && marketBundle && marketBundle.drafts.length > 0
+              ? marketBundle.drafts
+              : undefined,
+          existingEventTitle:
+            !startOver && marketBundle ? marketBundle.eventTitle : undefined,
+        }),
       });
       const json = (await res.json()) as {
-        passes?: boolean;
         assistantMessage?: string;
-        draft?: MarketDraft;
+        drafts?: MarketDraft[];
+        eventTitle?: string | null;
+        isMarketGroup?: boolean;
+        mutationAck?: boolean;
         error?: string;
+        groupReconcileApplied?: boolean;
+        groupReconciliation?: GroupReconciliationPayload | null;
       };
       const elapsed = Date.now() - started;
       if (elapsed < PREMIUM_MIN_WAIT_MS) {
@@ -760,34 +846,92 @@ export function CreateMarketFlow() {
             role: "assistant",
             text:
               json.error ||
-              "Validation is temporarily unavailable. Try again in a moment.",
+              "Something went wrong. Try again in a moment.",
           },
         ]);
         return;
       }
-      if (json.passes === false) {
-        setMessages((m) => [
-          ...m,
-          {
-            role: "assistant",
-            text:
-              json.assistantMessage ||
-              "That doesn’t meet the bar for a public, verifiable market yet. Tighten the YES/NO and anchor it to something the world can check.",
-          },
-        ]);
-        return;
+
+      const rawDrafts = Array.isArray(json.drafts) ? json.drafts : [];
+      let drafts =
+        rawDrafts.length > 0
+          ? dedupeWinnerDrafts(rawDrafts)
+          : [];
+
+      if (drafts.length > 1) {
+        drafts = alignGroupDraftExpiries(drafts);
       }
-      if (json.passes === true && json.draft) {
-        setDraft(json.draft);
-        setMessages((m) => [
-          ...m,
-          {
-            role: "assistant",
-            text:
-              json.assistantMessage ||
-              "Looks good — review the draft and add a cover image that fits this market.",
-          },
-        ]);
+
+      if (
+        !startOver &&
+        !json.groupReconcileApplied &&
+        marketBundle &&
+        marketBundle.drafts.length > 1 &&
+        drafts.length > 0
+      ) {
+        const hadNoneBin = marketBundle.drafts.some(isNoneOfListedOutcomeDraft);
+        const rec = reconcileGroupedDraftOutcomeMutations({
+          userPrompt: text,
+          previousDrafts: marketBundle.drafts,
+          llmDrafts: drafts,
+        });
+        drafts = rec.drafts;
+        const stillHasNone = drafts.some(isNoneOfListedOutcomeDraft);
+        const removedNone = hadNoneBin && !stillHasNone;
+        logDraftMutation({
+          intent: removedNone
+            ? "remove_outcome"
+            : rec.reconciliationApplied
+              ? "reconcile"
+              : "noop",
+          target: removedNone ? "none_of_listed" : undefined,
+          beforeCount: marketBundle.drafts.length,
+          afterCount: drafts.length,
+          beforeQuestions: marketBundle.drafts.map((d) => d.question),
+          afterQuestions: drafts.map((d) => d.question),
+        });
+      }
+
+      let assistantMessage = json.assistantMessage?.trim() ?? "";
+      const mutationAck = Boolean(json.mutationAck);
+
+      const clarifying =
+        assistantMessage.includes("?") &&
+        /when|what time|time zone|end (\?|this|the|on)|already in the past|pick a future|which day|\butc\b|confirm/i.test(
+          assistantMessage,
+        );
+
+      if (drafts.length >= 1 && !clarifying && !mutationAck) {
+        const isMulti =
+          drafts.length > 1 || Boolean(json.isMarketGroup);
+        assistantMessage = isMulti
+          ? "Here are the markets. You can create them now, or tell me what to edit."
+          : "Looks good — you can create it now, or tell me what to change.";
+      } else if (drafts.length === 0 && !startOver && marketBundle) {
+        assistantMessage =
+          assistantMessage ||
+          "What would you like to change? If you need an end time, say when this market should close.";
+      } else if (!assistantMessage) {
+        assistantMessage =
+          drafts.length > 0
+            ? "Looks good — you can create it now, or tell me what to change."
+            : "Tell me a bit more about what you want to predict.";
+      }
+
+      setMessages((m) => [...m, { role: "assistant", text: assistantMessage }]);
+
+      if (drafts.length >= 1 || json.groupReconciliation) {
+        setMarketBundle({
+          eventTitle:
+            json.eventTitle?.trim() ||
+            json.groupReconciliation?.matchedEventTitle?.trim() ||
+            marketBundle?.eventTitle ||
+            null,
+          drafts,
+          groupReconciliation: json.groupReconciliation ?? null,
+        });
+      } else if (startOver) {
+        setMarketBundle(null);
       }
     } catch {
       const elapsed = Date.now() - started;
@@ -800,7 +944,7 @@ export function CreateMarketFlow() {
         ...m,
         {
           role: "assistant",
-          text: "Couldn’t reach Grok. Check your connection and API configuration, then try again.",
+          text: "Couldn’t reach the assistant. Check your connection and API configuration, then try again.",
         },
       ]);
     } finally {
@@ -840,7 +984,8 @@ export function CreateMarketFlow() {
                       input={input}
                       setInput={setInput}
                       busy={busy}
-                      draft={draft}
+                      submitLocked={submitLocked}
+                      hasDraft={hasBundle}
                       onSend={() => void handleSend()}
                     />
                   </motion.div>
@@ -890,52 +1035,156 @@ export function CreateMarketFlow() {
 
                   {busy && <PremiumThinking />}
 
-                  {draft && (
+                  {marketBundle &&
+                    (primaryDraft || marketBundle.groupReconciliation) && (
                     <motion.div
                       initial={{ opacity: 0, y: 12 }}
                       animate={{ opacity: 1, y: 0 }}
                       transition={{ type: "spring", stiffness: 360, damping: 32 }}
                       className="mt-4 space-y-4 border-t border-white/[0.06] pt-4"
                     >
-                      <div className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4">
-                        <h3 className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-                          Market title
-                        </h3>
-                        <p className="mt-1.5 text-[15px] font-medium leading-snug text-zinc-100">
-                          {draft.question}
-                        </p>
-                        <h3 className="mt-4 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-                          Description
-                        </h3>
-                        <p className="mt-1.5 text-[12px] leading-relaxed text-zinc-400">
-                          {draft.description}
-                        </p>
-                        <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-                          <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-3 py-2.5">
-                            <div className="text-[9px] font-semibold uppercase tracking-wider text-zinc-500">
-                              Yes
-                            </div>
-                            <p className="mt-0.5 text-[11px] text-zinc-400">
-                              Event occurs as stated.
+                      {(() => {
+                        const rec = marketBundle.groupReconciliation;
+                        const displayEventTitle =
+                          marketBundle.eventTitle?.trim() ||
+                          rec?.matchedEventTitle?.trim() ||
+                          "";
+                        const showEventChrome =
+                          Boolean(displayEventTitle) &&
+                          (draftCount > 1 || Boolean(rec));
+                        return showEventChrome ? (
+                          <div className="rounded-2xl border border-white/[0.1] bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-4 py-3">
+                            <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                              Event
+                            </p>
+                            <p className="mt-1 text-[14px] font-medium leading-snug text-zinc-100">
+                              {displayEventTitle}
                             </p>
                           </div>
-                          <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-3 py-2.5">
-                            <div className="text-[9px] font-semibold uppercase tracking-wider text-zinc-500">
-                              No
-                            </div>
-                            <p className="mt-0.5 text-[11px] text-zinc-400">
-                              Otherwise.
-                            </p>
-                          </div>
-                        </div>
-                        <h3 className="mt-4 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
-                          Resolution rules
-                        </h3>
-                        <p className="mt-1.5 text-[12px] leading-relaxed text-zinc-400">
-                          {draft.resolutionRules}
-                        </p>
-                      </div>
+                        ) : null;
+                      })()}
 
+                      {marketBundle.groupReconciliation ? (
+                        <div className="rounded-2xl border border-sky-500/20 bg-gradient-to-b from-sky-500/[0.07] to-white/[0.02] px-4 py-3.5">
+                          <p className="text-[13px] font-semibold text-zinc-100">
+                            {marketBundle.groupReconciliation.headline}
+                          </p>
+                          {marketBundle.groupReconciliation.existingOutcomeLabels
+                            .length > 0 ? (
+                            <div className="mt-3">
+                              <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                                Already existing
+                              </p>
+                              <ul className="mt-1.5 space-y-1">
+                                {marketBundle.groupReconciliation.existingOutcomeLabels.map(
+                                  (label, i) => (
+                                    <li
+                                      key={`eo-${i}-${label}`}
+                                      className="flex items-start gap-2 text-[12px] leading-snug text-zinc-300"
+                                    >
+                                      <span
+                                        className="mt-0.5 text-emerald-400"
+                                        aria-hidden
+                                      >
+                                        ✓
+                                      </span>
+                                      <span>{label}</span>
+                                    </li>
+                                  ),
+                                )}
+                              </ul>
+                            </div>
+                          ) : null}
+                          {marketBundle.groupReconciliation.newOutcomeLabels
+                            .length > 0 ? (
+                            <div className="mt-3">
+                              <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                                New outcomes to create
+                              </p>
+                              <ul className="mt-1.5 space-y-1">
+                                {marketBundle.groupReconciliation.newOutcomeLabels.map(
+                                  (label, i) => (
+                                    <li
+                                      key={`no-${i}-${label}`}
+                                      className="flex items-start gap-2 text-[12px] leading-snug text-sky-100/95"
+                                    >
+                                      <span className="mt-0.5" aria-hidden>
+                                        +
+                                      </span>
+                                      <span>{label}</span>
+                                    </li>
+                                  ),
+                                )}
+                              </ul>
+                            </div>
+                          ) : (
+                            <p className="mt-2 text-[12px] leading-relaxed text-zinc-400">
+                              All outcomes already exist for this event.
+                            </p>
+                          )}
+                        </div>
+                      ) : null}
+
+                      {draftCount > 1 ? (
+                        <ul className="space-y-2.5">
+                          {marketBundle.drafts.map((d, idx) => (
+                            <li
+                              key={`m-${idx}-${d.question.slice(0, 48)}`}
+                              className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <p className="min-w-0 flex-1 text-[14px] font-medium leading-snug text-zinc-100">
+                                  {d.question}
+                                </p>
+                              </div>
+                              <p className="mt-2 whitespace-pre-wrap text-[11px] leading-relaxed text-zinc-500">
+                                {d.resolutionRules}
+                              </p>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : primaryDraft ? (
+                        <div className="rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4">
+                          <h3 className="text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                            Market title
+                          </h3>
+                          <p className="mt-1.5 text-[15px] font-medium leading-snug text-zinc-100">
+                            {primaryDraft.question}
+                          </p>
+                          <h3 className="mt-4 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                            Description
+                          </h3>
+                          <p className="mt-1.5 text-[12px] leading-relaxed text-zinc-400">
+                            {primaryDraft.description}
+                          </p>
+                          <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                            <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-3 py-2.5">
+                              <div className="text-[9px] font-semibold uppercase tracking-wider text-zinc-500">
+                                Yes
+                              </div>
+                              <p className="mt-0.5 text-[11px] text-zinc-400">
+                                Event occurs as stated.
+                              </p>
+                            </div>
+                            <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-3 py-2.5">
+                              <div className="text-[9px] font-semibold uppercase tracking-wider text-zinc-500">
+                                No
+                              </div>
+                              <p className="mt-0.5 text-[11px] text-zinc-400">
+                                Otherwise.
+                              </p>
+                            </div>
+                          </div>
+                          <h3 className="mt-4 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                            Resolution rules
+                          </h3>
+                          <p className="mt-1.5 text-[12px] leading-relaxed text-zinc-400">
+                            {primaryDraft.resolutionRules}
+                          </p>
+                        </div>
+                      ) : null}
+
+                      {primaryDraft ? (
                       <div className="rounded-2xl border border-dashed border-white/[0.1] bg-white/[0.02] p-4">
                         <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
                           <div className="relative mx-auto flex h-24 w-full max-w-[160px] shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/[0.08] bg-black/30 sm:mx-0">
@@ -953,10 +1202,10 @@ export function CreateMarketFlow() {
                           </div>
                           <div className="min-w-0 flex-1">
                             <h3 className="text-[13px] font-medium text-zinc-200">
-                              Market image
+                              Cover image
                             </h3>
                             <p className="mt-0.5 text-[11px] text-zinc-500">
-                              Grok checks that the art matches this market.
+                              One image applies to {draftCount > 1 ? "all markets in this group" : "this market"}.
                             </p>
                             {imageChecking && (
                               <p className="mt-2 flex items-center gap-2 text-[11px] text-zinc-400">
@@ -989,7 +1238,8 @@ export function CreateMarketFlow() {
                                 disabled={imageChecking}
                                 onChange={(e) => {
                                   const f = e.target.files?.[0];
-                                  if (f && draft) void validateImageFile(f, draft);
+                                  if (f && primaryDraft)
+                                    void validateImageFile(f, primaryDraft);
                                 }}
                               />
                               Choose file
@@ -997,10 +1247,13 @@ export function CreateMarketFlow() {
                           </div>
                         </div>
                       </div>
+                      ) : null}
 
-                      <p className="text-[11px] leading-relaxed text-zinc-500">
-                        {draft.aiReasoning}
-                      </p>
+                      {draftCount === 1 && primaryDraft ? (
+                        <p className="text-[11px] leading-relaxed text-zinc-500">
+                          {primaryDraft.aiReasoning}
+                        </p>
+                      ) : null}
 
                       {createBlockedReason && !marketCreated && (
                         <p className="text-center text-[11px] text-amber-200/90">
@@ -1008,7 +1261,7 @@ export function CreateMarketFlow() {
                         </p>
                       )}
 
-                      {!marketCreated && draft ? (
+                      {!marketCreated && primaryDraft ? (
                         <div
                           className="flex items-center justify-center gap-1 rounded-xl border border-white/[0.08] bg-white/[0.03] p-1"
                           role="group"
@@ -1038,7 +1291,7 @@ export function CreateMarketFlow() {
                         </div>
                       ) : null}
 
-                      {marketEngine === "PM_AMM" && !marketCreated ? (
+                      {marketEngine === "PM_AMM" && !marketCreated && primaryDraft ? (
                         <div className="space-y-2 rounded-xl border border-white/[0.08] bg-white/[0.03] px-3 py-3">
                           <label
                             htmlFor="pmamm-initial-liquidity"
@@ -1120,7 +1373,9 @@ export function CreateMarketFlow() {
                         <div className="space-y-3 rounded-xl border border-emerald-500/25 bg-emerald-950/25 px-4 py-4 ring-1 ring-emerald-500/15">
                           <div>
                             <p className="text-[12px] font-medium text-emerald-100/95">
-                              Market created
+                              {batchCreatedSlugs.length > 1
+                                ? `Markets created (${batchCreatedSlugs.length})`
+                                : "Market created"}
                             </p>
                             <p className="mt-1 text-[11px] leading-relaxed text-zinc-500">
                               On-chain setup completed (devnet). Review the
@@ -1139,6 +1394,20 @@ export function CreateMarketFlow() {
                               pipeline).
                             </p>
                           )}
+                          {batchCreatedSlugs.length > 1 ? (
+                            <ul className="space-y-1 text-[11px] text-zinc-400">
+                              {batchCreatedSlugs.map((s) => (
+                                <li key={s}>
+                                  <a
+                                    href={`/markets/${encodeURIComponent(s)}`}
+                                    className="text-emerald-400/90 underline decoration-emerald-500/35 underline-offset-2"
+                                  >
+                                    {s}
+                                  </a>
+                                </li>
+                              ))}
+                            </ul>
+                          ) : null}
                           <ul className="space-y-1.5 text-[10px] text-zinc-500">
                             {(
                               [
@@ -1170,13 +1439,15 @@ export function CreateMarketFlow() {
                                 </li>
                               ))}
                           </ul>
-                          <button
-                            type="button"
-                            onClick={() => goToCreatedMarket()}
-                            className="flex w-full items-center justify-center gap-2 rounded-full bg-white py-3 text-[13px] font-semibold text-[#0a0a0c] shadow-[0_0_24px_-8px_rgba(255,255,255,0.35)] transition hover:bg-zinc-100"
-                          >
-                            Go to market
-                          </button>
+                          <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+                            <button
+                              type="button"
+                              onClick={() => goToCreatedMarket()}
+                              className="flex w-full items-center justify-center gap-2 rounded-full bg-white py-3 text-[13px] font-semibold text-[#0a0a0c] shadow-[0_0_24px_-8px_rgba(255,255,255,0.35)] transition hover:bg-zinc-100 sm:flex-1"
+                            >
+                              Go to market
+                            </button>
+                          </div>
                         </div>
                       ) : (
                         <motion.button
@@ -1201,7 +1472,15 @@ export function CreateMarketFlow() {
                           ) : (
                             <Sparkles className="h-4 w-4" />
                           )}
-                          {creatingMarket ? "Creating…" : "Create market"}
+                          {creatingMarket
+                            ? "Creating…"
+                            : pendingCreateCount === 0
+                              ? "Nothing new to create"
+                              : draftCount > 1
+                                ? pendingCreateCount === draftCount
+                                  ? `Create ${pendingCreateCount} markets`
+                                  : `Create ${pendingCreateCount} new market${pendingCreateCount === 1 ? "" : "s"}`
+                                : "Create market"}
                         </motion.button>
                       )}
                     </motion.div>
@@ -1217,7 +1496,13 @@ export function CreateMarketFlow() {
                     input={input}
                     setInput={setInput}
                     busy={busy}
-                    draft={draft}
+                    submitLocked={submitLocked}
+                    hasDraft={hasBundle}
+                    placeholderHint={
+                      hasBundle
+                        ? undefined
+                        : "e.g. a team name, “first one”, or “create all”…"
+                    }
                     onSend={() => void handleSend()}
                   />
                 </motion.div>

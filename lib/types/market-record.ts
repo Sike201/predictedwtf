@@ -47,6 +47,15 @@ export interface MarketRecord {
   market_address?: string | null;
   usdc_mint?: string | null;
   pmamm_market_id?: string | null;
+  /** Stable slug shared by all binaries in one event (feed grouping). */
+  event_group_key?: string | null;
+  /** Display title for the event group card / event page. */
+  event_title?: string | null;
+  /** Short label for this row (e.g. candidate or "Draw"). */
+  outcome_label?: string | null;
+  /** winner | best_performer | match_result | custom */
+  outcome_type?: string | null;
+  group_order?: number | null;
 }
 
 export interface CreateMarketPayload {

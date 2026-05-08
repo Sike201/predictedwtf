@@ -6,6 +6,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { withResolvedBinaryDisplay } from "@/lib/market/resolved-binary-prices";
 import { filterFeedMarkets } from "@/lib/data/filter-markets";
 import { MarketCard } from "@/components/markets/market-card";
+import { GroupedEventCard } from "@/components/markets/grouped-event-card";
+import {
+  partitionMarketsForEventGroups,
+} from "@/lib/market/group-feed-markets";
 import { CategoryFilterBar } from "@/components/markets/category-filter-bar";
 import {
   HOMEPAGE_CACHE_WARM_MAX,
@@ -185,6 +189,11 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
     return list.filter((m) => m.question.toLowerCase().includes(q));
   }, [list, navSearchQuery]);
 
+  const feedPartition = useMemo(
+    () => partitionMarketsForEventGroups(listForDisplay),
+    [listForDisplay],
+  );
+
   return (
     <div className="bg-black px-3 pb-24 pt-4 sm:px-4 lg:px-6">
       <div className="mx-auto max-w-[1920px]">
@@ -226,9 +235,13 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
             },
           }}
         >
-          {listForDisplay.map((m) => (
+          {feedPartition.map((item) => (
             <motion.div
-              key={m.id}
+              key={
+                item.type === "group"
+                  ? `event:${item.groupKey}`
+                  : item.market.id
+              }
               variants={{
                 hidden: { opacity: 0, y: 18, filter: "blur(6px)" },
                 show: {
@@ -239,7 +252,15 @@ export function MarketFeed({ initialMarkets }: MarketFeedProps) {
                 },
               }}
             >
-              <MarketCard market={m} />
+              {item.type === "group" ? (
+                <GroupedEventCard
+                  groupKey={item.groupKey}
+                  title={item.title}
+                  markets={item.markets}
+                />
+              ) : (
+                <MarketCard market={item.market} />
+              )}
             </motion.div>
           ))}
         </motion.div>

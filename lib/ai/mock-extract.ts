@@ -1,14 +1,17 @@
 import type { MarketDraft } from "@/lib/types/market";
 
+import { resolveMarketDraftExpiry } from "@/lib/market/draft-expiry-resolve";
+
 /**
  * MVP stub — replace with real model + validation via API route.
  */
 export function extractMarketFromPrompt(userText: string): MarketDraft {
   const trimmed = userText.trim() || "Untitled market";
-  const hasJune2027 = /june\s+2027|2027-06/i.test(trimmed);
-  const expiry = hasJune2027
-    ? "2027-06-30T23:59:59.000Z"
-    : new Date(Date.now() + 86400000 * 365).toISOString();
+  const expiry = resolveMarketDraftExpiry({
+    expiryRaw: "",
+    phraseBlock: trimmed,
+    fallbackIso: new Date(Date.now() + 86400000 * 365).toISOString(),
+  });
 
   const rules = [
     "Resolver verifies the outcome using primary public sources cited below.",

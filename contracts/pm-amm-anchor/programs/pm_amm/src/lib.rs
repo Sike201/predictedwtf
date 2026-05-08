@@ -46,8 +46,9 @@ pub mod pm_amm {
         market_id: u64,
         end_ts: i64,
         name: String,
+        resolver: Pubkey,
     ) -> Result<()> {
-        instructions::initialize_market::handler(ctx, market_id, end_ts, name)
+        instructions::initialize_market::handler(ctx, market_id, end_ts, name, resolver)
     }
 
     /// Deposit USDC as liquidity. First deposit bootstraps L_0 at 50/50 price.
@@ -100,8 +101,8 @@ pub mod pm_amm {
         instructions::suggest_l_zero::handler(ctx, budget_usdc, sigma_bps)
     }
 
-    /// Resolve the market after expiration. Authority-only.
-    /// Triggers final accrual and sets the winning side.
+    /// Resolve the market. Before expiry only `market.authority` or `market.resolver` may sign;
+    /// after expiry the same authorization applies. Triggers final accrual and sets the winning side.
     pub fn resolve_market(ctx: Context<ResolveMarket>, winning_side: Side) -> Result<()> {
         instructions::resolve_market::handler(ctx, winning_side)
     }

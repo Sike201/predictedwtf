@@ -84,7 +84,7 @@ async function main() {
 
     // Create market
     await (program.methods as any)
-      .initializeMarket(new anchor.BN(marketId), new anchor.BN(endTs), m.name)
+      .initializeMarket(new anchor.BN(marketId), new anchor.BN(endTs), m.name, wallet)
       .accounts({
         authority: wallet,
         market: marketPda,

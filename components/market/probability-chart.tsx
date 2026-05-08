@@ -21,6 +21,8 @@ export type ProbabilityChartProps = {
   className?: string;
   /** When this changes, the line stroke re-draws (e.g. history load, range, live tick). */
   drawEpoch?: string;
+  /** Extra label in hover tooltip (e.g. grouped outcome name). */
+  tooltipSubtitle?: string | null;
 };
 
 /** ViewBox width; height tuned for a taller chart. */
@@ -63,6 +65,7 @@ export function ProbabilityChart({
   xTickCount = 5,
   className,
   drawEpoch = "default",
+  tooltipSubtitle,
 }: ProbabilityChartProps) {
   const [hover, setHover] = useState<{
     svgX: number;
@@ -269,7 +272,7 @@ export function ProbabilityChart({
       </svg>
       {hover ? (
         <div
-          className="pointer-events-none fixed z-20 max-w-[200px] rounded-md bg-zinc-950/95 px-2.5 py-1.5 text-[10px] text-zinc-200 shadow-lg ring-1 ring-white/[0.08]"
+          className="pointer-events-none fixed z-20 max-w-[220px] rounded-md bg-zinc-950/95 px-2.5 py-1.5 text-[10px] text-zinc-200 shadow-lg ring-1 ring-white/[0.08]"
           style={{
             left: Math.max(
               8,
@@ -287,7 +290,28 @@ export function ProbabilityChart({
             ),
           }}
         >
-          <div className="tabular-nums text-zinc-500">
+          {tooltipSubtitle ? (
+            <div className="truncate text-[10px] font-semibold text-white">
+              {tooltipSubtitle}
+            </div>
+          ) : null}
+          <div
+            className={cn(
+              "font-semibold tabular-nums text-white",
+              tooltipSubtitle ? "mt-1" : "mt-0.5",
+            )}
+          >
+            {tooltipSubtitle ? (
+              <>YES {Math.round(hover.p * 100)}%</>
+            ) : (
+              <>{Math.round(hover.p * 100)}%</>
+            )}
+          </div>
+          <div
+            className={cn(
+              "mt-1 tabular-nums text-zinc-500",
+            )}
+          >
             {new Date(hover.t).toLocaleString(undefined, {
               month: "short",
               day: "numeric",
@@ -295,9 +319,6 @@ export function ProbabilityChart({
               minute: "2-digit",
               second: spanMs <= 6 * 60 * 60 * 1000 ? "2-digit" : undefined,
             })}
-          </div>
-          <div className="mt-0.5 font-semibold tabular-nums text-white">
-            {Math.round(hover.p * 100)}%
           </div>
         </div>
       ) : null}

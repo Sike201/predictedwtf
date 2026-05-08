@@ -4,7 +4,7 @@ import {
   TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, SystemProgram } from "@solana/web3.js";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import { pinMarketImageToIpfs } from "@/lib/storage/pinata";
 import {
@@ -49,30 +49,41 @@ import {
   resolveMarketExpiryInputForDatabase,
 } from "@/lib/market/utc-instant";
 import { classifyMarketCategoryWithGrok } from "@/lib/market/grok-classify-market-category";
-import { TRUSTED_RESOLVER_ADDRESS } from "@/lib/market/trusted-resolver";
+import {
+  TRUSTED_RESOLVER_ADDRESS,
+  getServerTrustedResolverAddressStrict,
+} from "@/lib/market/trusted-resolver";
 import type { MarketRecord, MarketStatus } from "@/lib/types/market-record";
 import type { MarketDraft, MarketEngine } from "@/lib/types/market";
 import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
 import {
+  createPmammProgram,
+  fetchPmammMarketAccount,
   pmammBuildDepositLiquidityUserTransaction,
   pmammBuildInitializeMarketTransaction,
-} from "@/lib/engines/pmamm";
+} from "@/lib/solana/pmamm-program";
 import { pmammMarketIdBnFromSeed } from "@/lib/solana/pmamm-market-id";
 import { derivePmammLpPda } from "@/lib/solana/pmamm-pda";
 import { assertPmammDepositTxFromCreator } from "@/lib/solana/pmamm-verify-user-deposit-tx";
-import {
-  getPmammCollateralMint,
-  requirePmammProgramId,
-} from "@/lib/solana/pmamm-config";
+import { logPmammMarketAccountRawLayoutProbe } from "@/lib/solana/pmamm-market-raw-layout";
+import { getPmammCollateralMint, requirePmammProgramId } from "@/lib/solana/pmamm-config";
 import { parsePmammInitialLiquidityUsdcInput } from "@/lib/market/pmamm-initial-liquidity";
 import { validatePmammCollateralMint } from "@/lib/solana/pmamm-validate-collateral";
 import {
   preflightPmammInitialLpUsdc,
   readPmammDepositorUsdcBalance,
 } from "@/lib/solana/pmamm-initial-lp-preflight";
+import { coerceUsdVolumeFromDb } from "@/lib/market/coerce-db-numeric";
+import {
+  groupMetaFromQuestion,
+  normalizeOutcomeLabel,
+  normalizeStoredGroupKey,
+} from "@/lib/market/group-feed-markets";
 
 const LP = "[predicted][pipeline]";
 const CREATE_LIFECYCLE_LOG = "[predicted][create-market-lifecycle]";
+const EXPECTED_PMAMM_CREATE_RESOLVER =
+  "AayL4RVTNeqTRi4YaAWcMmv6pfx4ctNLwYUVyCEfgt7s";
 
 function solanaPipelineStage(
   stage: PipelineFailureStage,
@@ -108,6 +119,8 @@ export type CreateMarketResult =
   | {
       ok: true;
       market: MarketRecord;
+      /** Same event/outcome already exists (live or creating); skip chain setup. */
+      reusedExisting?: boolean;
       /** Creator must sign and submit this tx (pmAMM create only). */
       pmammAwaitingUserDeposit?: {
         depositTransactionBase64: string;
@@ -122,6 +135,8 @@ export type CreateMarketResult =
       missingProgramId?: string;
       /** `FAILED_AT_OUTCOME_ATA` — engine ATA / mint / program debugging context. */
       outcomeAtaContext?: Record<string, string>;
+      /** Development + PM_AMM only: resolver env snapshot for browser debugging. */
+      pmammResolverDebug?: PmammResolverCreateDevDebug;
     };
 
 function makeSlug(title: string): string {
@@ -147,10 +162,151 @@ function splitYesNo(draft: MarketDraft, yes?: string, no?: string) {
   return { yes: y, no: n };
 }
 
+function dbStatusRank(s: MarketStatus): number {
+  if (s === "live") return 0;
+  if (s === "creating") return 1;
+  return 2;
+}
+
+function pickBestDuplicateMarketRecord(rows: MarketRecord[]): MarketRecord {
+  return [...rows].sort((a, b) => {
+    const ra = dbStatusRank(a.status);
+    const rb = dbStatusRank(b.status);
+    if (ra !== rb) return ra - rb;
+    const va = coerceUsdVolumeFromDb(a.last_known_volume_usd);
+    const vb = coerceUsdVolumeFromDb(b.last_known_volume_usd);
+    if (vb !== va) return vb - va;
+    return Date.parse(b.created_at) - Date.parse(a.created_at);
+  })[0]!;
+}
+
+async function findReusedWinnerMarketIfDuplicate(
+  sb: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  question: string,
+): Promise<MarketRecord | null> {
+  const incoming = groupMetaFromQuestion(question);
+  if (!incoming) return null;
+  const { data, error } = await sb
+    .from("markets")
+    .select("*")
+    .in("status", ["live", "creating"]);
+  if (error || !data?.length) return null;
+  const rows = data as MarketRecord[];
+  const wantK = normalizeStoredGroupKey(incoming.groupKey);
+  const matches = rows.filter((r) => {
+    if (r.event_group_key?.trim() && r.outcome_label?.trim()) {
+      return (
+        normalizeStoredGroupKey(r.event_group_key) === wantK &&
+        normalizeOutcomeLabel(r.outcome_label) ===
+          normalizeOutcomeLabel(incoming.outcomeLabel)
+      );
+    }
+    const meta = groupMetaFromQuestion(r.title);
+    return (
+      meta != null &&
+      normalizeStoredGroupKey(meta.groupKey) === wantK &&
+      normalizeOutcomeLabel(meta.outcomeLabel) ===
+        normalizeOutcomeLabel(incoming.outcomeLabel)
+    );
+  });
+  if (matches.length === 0) return null;
+  return pickBestDuplicateMarketRecord(matches);
+}
+
+async function findReusedGroupedMarketIfDuplicate(
+  sb: NonNullable<ReturnType<typeof getSupabaseAdmin>>,
+  draft: MarketDraft,
+): Promise<MarketRecord | null> {
+  const egk = draft.eventGroupKey?.trim();
+  const ol = draft.outcomeLabel?.trim();
+  if (egk && ol) {
+    const wantK = normalizeStoredGroupKey(egk);
+    const wantL = normalizeOutcomeLabel(ol);
+    const { data, error } = await sb
+      .from("markets")
+      .select("*")
+      .in("status", ["live", "creating"]);
+    if (error || !data?.length) return null;
+    const rows = data as MarketRecord[];
+    const matches = rows.filter((r) => {
+      if (!r.event_group_key?.trim() || !r.outcome_label?.trim()) return false;
+      return (
+        normalizeStoredGroupKey(r.event_group_key) === wantK &&
+        normalizeOutcomeLabel(r.outcome_label) === wantL
+      );
+    });
+    if (matches.length === 0) return null;
+    return pickBestDuplicateMarketRecord(matches);
+  }
+  return findReusedWinnerMarketIfDuplicate(sb, draft.question);
+}
+
 async function markStatus(id: string, status: MarketStatus): Promise<void> {
   const sb = getSupabaseAdmin();
   if (!sb) return;
   await sb.from("markets").update({ status }).eq("id", id);
+}
+
+/** Dev-only JSON for `/api/market/create` when pmAMM fails (no secrets). */
+export type PmammResolverCreateDevDebug = {
+  rawEnvTrustedResolver: string | null;
+  nextPublicTrustedResolver: string | null;
+  importedTrustedResolverConstant: string;
+  strictResolverHelper: string | null;
+  resolverPkPassedToBuilder: string | null;
+  marketEngine: MarketEngine;
+  decoded_resolver_arg: string | null;
+  postInitOnChainResolver: string | null;
+  /** pmAMM program `market_id` u64 string; null if not derived yet. */
+  market_id: string | null;
+  market_pda: string | null;
+  slug: string;
+  stage: PipelineFailureStage | string;
+};
+
+function makePmammResolverDevDebug(
+  engine: MarketEngine,
+  slug: string,
+  stage: PipelineFailureStage | string,
+  extras: {
+    market_id?: string | null;
+    market_pda?: string | null;
+    resolverPkPassedToBuilder?: string | null;
+    decoded_resolver_arg?: string | null;
+    postInitOnChainResolver?: string | null;
+  } = {},
+): PmammResolverCreateDevDebug | undefined {
+  if (process.env.NODE_ENV !== "development") return undefined;
+  if (engine !== "PM_AMM") return undefined;
+  let strictResolverHelper: string | null = null;
+  try {
+    strictResolverHelper = getServerTrustedResolverAddressStrict().toBase58();
+  } catch {
+    strictResolverHelper = null;
+  }
+  let resolverPkPassedToBuilder = extras.resolverPkPassedToBuilder ?? null;
+  if (resolverPkPassedToBuilder == null) {
+    try {
+      resolverPkPassedToBuilder = getServerTrustedResolverAddressStrict().toBase58();
+    } catch {
+      resolverPkPassedToBuilder = null;
+    }
+  }
+  return {
+    rawEnvTrustedResolver: process.env.TRUSTED_RESOLVER_ADDRESS ?? null,
+    nextPublicTrustedResolver:
+      process.env.NEXT_PUBLIC_TRUSTED_RESOLVER_ADDRESS ?? null,
+    importedTrustedResolverConstant: TRUSTED_RESOLVER_ADDRESS,
+    strictResolverHelper,
+    resolverPkPassedToBuilder,
+    marketEngine: engine,
+    decoded_resolver_arg: extras.decoded_resolver_arg ?? null,
+    postInitOnChainResolver: extras.postInitOnChainResolver ?? null,
+    market_id: extras.market_id ?? null,
+    market_pda: extras.market_pda ?? null,
+    slug,
+    stage,
+  };
 }
 
 /**
@@ -175,11 +331,13 @@ export async function createMarketPipeline(
     return { ok: false, error: "Invalid creator wallet address." };
   }
 
-  let trustedResolver: PublicKey;
-  try {
-    trustedResolver = new PublicKey(TRUSTED_RESOLVER_ADDRESS.trim());
-  } catch {
-    return { ok: false, error: "Invalid TRUSTED_RESOLVER_ADDRESS configuration." };
+  const reused = await findReusedGroupedMarketIfDuplicate(sb, input.draft);
+  if (reused) {
+    console.info(`${LP} reuse existing row for grouped outcome`, {
+      slug: reused.slug,
+      title: reused.title,
+    });
+    return { ok: true, market: reused, reusedExisting: true };
   }
 
   const { yes, no } = splitYesNo(
@@ -190,6 +348,20 @@ export async function createMarketPipeline(
   const slug = makeSlug(input.draft.question);
   const engine: MarketEngine =
     input.engine === "PM_AMM" ? "PM_AMM" : "GAMM";
+
+  let trustedResolver: PublicKey;
+  try {
+    if (engine === "PM_AMM") {
+      trustedResolver = getServerTrustedResolverAddressStrict();
+    } else {
+      trustedResolver = new PublicKey(TRUSTED_RESOLVER_ADDRESS.trim());
+    }
+  } catch (e) {
+    const msg =
+      e instanceof Error ? e.message : "Invalid TRUSTED_RESOLVER_ADDRESS configuration.";
+    return { ok: false, error: msg };
+  }
+
   const draftExpiryRaw = input.draft.expiry;
   const expiryResolved = resolveMarketExpiryInputForDatabase({
     draftExpiry: draftExpiryRaw,
@@ -249,6 +421,18 @@ export async function createMarketPipeline(
     status: "creating" as const,
     image_cid: imageCid,
     market_engine: engine,
+    ...(input.draft.eventGroupKey?.trim()
+      ? {
+          event_group_key: normalizeStoredGroupKey(input.draft.eventGroupKey.trim()),
+          event_title: input.draft.eventTitle?.trim() ?? null,
+          outcome_label: input.draft.outcomeLabel?.trim() ?? null,
+          outcome_type: input.draft.outcomeType?.trim() ?? null,
+          group_order:
+            typeof input.draft.groupOrder === "number"
+              ? input.draft.groupOrder
+              : null,
+        }
+      : {}),
   };
   console.info(
     CREATE_LIFECYCLE_LOG,
@@ -307,6 +491,8 @@ export async function createMarketPipeline(
 
   const marketId = inserted.id;
   const connection = getConnection();
+  let pmammResolverDevDebug: PmammResolverCreateDevDebug | undefined;
+  let pmammMarketIdStr: string | null = null;
 
   try {
     const mockChain = process.env.MOCK_CHAIN === "1";
@@ -322,7 +508,6 @@ export async function createMarketPipeline(
     let createdTxSig: string | null = null;
     let authorityYesAta: PublicKey | null = null;
     let authorityNoAta: PublicKey | null = null;
-    let pmammMarketIdStr: string | null = null;
 
     if (engine === "PM_AMM") {
       if (mockChain) {
@@ -345,7 +530,6 @@ export async function createMarketPipeline(
         );
       }
       const collateralMintPk = getPmammCollateralMint();
-      await validatePmammCollateralMint(connection, collateralMintPk);
       const liqParsed = parsePmammInitialLiquidityUsdcInput(
         input.initialLiquidityUsdc,
       );
@@ -374,15 +558,69 @@ export async function createMarketPipeline(
         marketId: pmammMarketIdStr,
         endTs: endTsSec,
       });
+      let pmammDebugResolverPk: string | null = null;
+      let pmammDebugDecodedResolver: string | null = null;
+      let pmammDebugMarketPda: string | null = null;
+      let pmammDebugPostInitResolver: string | null = null;
       try {
+        const resolverPk = getServerTrustedResolverAddressStrict();
+        pmammDebugResolverPk = resolverPk.toBase58();
+        if (resolverPk.toBase58() !== EXPECTED_PMAMM_CREATE_RESOLVER) {
+          throw new Error(
+            `Wrong resolver passed to pmAMM init: ${resolverPk.toBase58()}`,
+          );
+        }
+        const rawEnvTrusted = process.env.TRUSTED_RESOLVER_ADDRESS;
+        if (resolverPk.toBase58() !== (rawEnvTrusted?.trim() ?? "")) {
+          console.error(
+            "[predicted][pmamm-create] TRUSTED* env snapshot (resolver preflight failed)",
+            Object.fromEntries(
+              Object.entries(process.env).filter(([k]) => k.includes("TRUSTED")),
+            ),
+          );
+          throw new Error(
+            `Wrong resolver passed to pmAMM init: expected ${process.env.TRUSTED_RESOLVER_ADDRESS}, got ${resolverPk.toBase58()}`,
+          );
+        }
+
+        console.info(
+          "[predicted][pmamm-create] before_pmammBuildInitializeMarketTransaction",
+          {
+            rawEnvTrustedResolver: process.env.TRUSTED_RESOLVER_ADDRESS,
+            nextPublicTrustedResolver:
+              process.env.NEXT_PUBLIC_TRUSTED_RESOLVER_ADDRESS,
+            importedTrustedResolverConstant: TRUSTED_RESOLVER_ADDRESS,
+            strictResolverHelper: getServerTrustedResolverAddressStrict().toBase58(),
+            resolverPkPassedToBuilder: resolverPk.toBase58(),
+            marketEngine: engine,
+            slug,
+            market_id: pmammMarketIdStr,
+          },
+        );
+        console.info(
+          "[predicted][pmamm-create] process.env keys containing TRUSTED",
+          Object.fromEntries(
+            Object.entries(process.env).filter(([k]) => k.includes("TRUSTED")),
+          ),
+        );
+
+        await validatePmammCollateralMint(connection, collateralMintPk);
         const built = await pmammBuildInitializeMarketTransaction({
           connection,
           authority: treasury.publicKey,
+          resolver: resolverPk,
           marketId: marketIdBn,
           endTs: new BN(endTsSec),
           name: onChainName,
         });
         built.transaction.partialSign(treasury);
+        pmammDebugDecodedResolver = built.decodedInitializeMarketResolverArg;
+        pmammDebugMarketPda = built.marketPda.toBase58();
+        console.info("[predicted][pmamm-create] market PDA for init", {
+          marketPdaForInit: pmammDebugMarketPda,
+          market_id: pmammMarketIdStr,
+          slug,
+        });
         const sim = await connection.simulateTransaction(built.transaction);
         if (sim.value.err) {
           const rawLogs = sim.value.logs;
@@ -404,7 +642,77 @@ export async function createMarketPipeline(
         yesMint = built.yesMint;
         noMint = built.noMint;
         poolAddress = built.marketPda;
+
+        const programForRead = createPmammProgram(connection, SystemProgram.programId);
+        console.info("[predicted][pmamm-create] market PDA fetched after init", {
+          marketPdaFetchedAfterInit: poolAddress.toBase58(),
+          market_id: pmammMarketIdStr,
+          slug,
+        });
+        const rawAcc = await connection.getAccountInfo(poolAddress, "confirmed");
+        if (rawAcc?.data) {
+          const u8 = Buffer.from(rawAcc.data as Buffer | Uint8Array);
+          const pmPid = requirePmammProgramId().toBase58();
+          logPmammMarketAccountRawLayoutProbe({
+            label: "post_initialize_market",
+            rawData: u8,
+            nextPublicPmammProgramId:
+              process.env.NEXT_PUBLIC_PMAMM_PROGRAM_ID?.trim() ?? null,
+            anchorProgramId: pmPid,
+          });
+        }
+        const freshMarket = await fetchPmammMarketAccount(programForRead, poolAddress);
+        pmammDebugPostInitResolver = freshMarket.resolver.toBase58();
+        const expectedStrictResolverBs58 = resolverPk.toBase58();
+        console.log("[pmAMM post-init] on-chain resolver =", freshMarket.resolver.toBase58());
+        console.log("[pmAMM post-init] expected resolver =", expectedStrictResolverBs58);
+        console.log("[pmAMM post-init] on-chain authority =", freshMarket.authority.toBase58());
+
+        if (freshMarket.resolver.toBase58() !== expectedStrictResolverBs58) {
+          const got = freshMarket.resolver.toBase58();
+          const auth = freshMarket.authority.toBase58();
+          const zeroDefault = PublicKey.default.toBase58();
+          const hints: string[] = [];
+          hints.push(
+            "Check the initialize_market transaction logs for msg!(\"initialize_market ...\") lines — if stored resolver is correct on-chain but the client reads zero/default, the IDL field order or copied lib/engines/idl/pm_amm.json is out of sync with the deployed program.",
+          );
+          hints.push(
+            "If logs show stored resolver as default while the arg was non-zero, the initialize_market instruction layout may not match the chain binary (wrong IDL / old client).",
+          );
+          if (got === auth) {
+            hints.push(
+              "Got equals authority — resolver arg was likely default() on-chain (instruction args mismatch) or the program still maps resolver incorrectly.",
+            );
+          }
+          if (got === zeroDefault) {
+            hints.push(
+              "Got all-zero pubkey — often wrong decode offset (stale IDL vs account) or resolver bytes never serialized; compare raw slice resolver above with Anchor decode.",
+            );
+          }
+          const namePrefix = Buffer.alloc(32);
+          namePrefix.write(onChainName.slice(0, 32));
+          const namePrefixAsPubkey = new PublicKey(namePrefix).toBase58();
+          if (got === namePrefixAsPubkey) {
+            hints.push(
+              "Got equals the first 32 bytes of the market name interpreted as a Pubkey — the active deployed program/account layout likely still has `resolver` after `name`, while this app/IDL reads `resolver` before `name`. Redeploy the rebuilt program to the same RPC/cluster the app uses, or point the app to the cluster you deployed.",
+            );
+          }
+          throw new PipelineStageError(
+            "FAILED_AT_PMAMM_INIT",
+            `Resolver mismatch after pmAMM init: expected ${expectedStrictResolverBs58}, got ${got}, authority ${auth}.${hints.length ? " " + hints.join(" ") : ""}`,
+          );
+        }
       } catch (e) {
+        const st: PipelineFailureStage | string = isPipelineStageError(e)
+          ? e.stage
+          : "FAILED_AT_PMAMM_INIT";
+        pmammResolverDevDebug = makePmammResolverDevDebug(engine, slug, st, {
+          market_id: pmammMarketIdStr,
+          market_pda: pmammDebugMarketPda,
+          resolverPkPassedToBuilder: pmammDebugResolverPk,
+          decoded_resolver_arg: pmammDebugDecodedResolver,
+          postInitOnChainResolver: pmammDebugPostInitResolver,
+        });
         if (isPipelineStageError(e)) throw e;
         throw solanaPipelineStage("FAILED_AT_PMAMM_INIT", formatUnknownError(e), e);
       }
@@ -464,6 +772,13 @@ export async function createMarketPipeline(
           }),
         ).toString("base64");
       } catch (e) {
+        const st: PipelineFailureStage | string = isPipelineStageError(e)
+          ? e.stage
+          : "FAILED_AT_PMAMM_DEPOSIT";
+        pmammResolverDevDebug = makePmammResolverDevDebug(engine, slug, st, {
+          market_id: pmammMarketIdStr,
+          market_pda: poolAddress.toBase58(),
+        });
         if (isPipelineStageError(e)) throw e;
         const diag = collectSolanaErrorDiagnostics(e);
         let msg = formatUnknownError(e);
@@ -832,6 +1147,22 @@ export async function createMarketPipeline(
         ? e.outcomeAtaContext
         : undefined;
 
+    if (engine === "PM_AMM" && process.env.NODE_ENV === "development") {
+      pmammResolverDevDebug =
+        pmammResolverDevDebug ??
+        makePmammResolverDevDebug(
+          engine,
+          slug,
+          stage ?? "FAILED_AT_PRECONDITION",
+          {
+            market_id: pmammMarketIdStr,
+          },
+        );
+    }
+    if (pmammResolverDevDebug && stage) {
+      pmammResolverDevDebug = { ...pmammResolverDevDebug, stage };
+    }
+
     await markStatus(marketId, "failed");
     return {
       ok: false,
@@ -839,6 +1170,7 @@ export async function createMarketPipeline(
       stage,
       missingProgramId: missingProgramId ?? undefined,
       outcomeAtaContext,
+      ...(pmammResolverDevDebug ? { pmammResolverDebug: pmammResolverDevDebug } : {}),
     };
   }
 }

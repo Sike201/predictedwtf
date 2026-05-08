@@ -238,7 +238,10 @@ mod tests {
             resolved: false,
             winning_side: 0,
             bump: 0,
+            layout_version: 2,
+            resolver: Pubkey::default(),
             name: [0u8; 64],
+            reserved: [0u8; 32],
         };
 
         market.set_l_zero_fixed(l_zero_fixed);

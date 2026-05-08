@@ -15,6 +15,17 @@ const YES_MINT_SEED = Buffer.from("yes_mint");
 const NO_MINT_SEED = Buffer.from("no_mint");
 const VAULT_SEED = Buffer.from("vault");
 const LP_SEED = Buffer.from("lp");
+const TOKEN_METADATA_PROGRAM = new PublicKey(
+  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+);
+
+function metadataPdaForMint(mint: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("metadata"), TOKEN_METADATA_PROGRAM.toBuffer(), mint.toBuffer()],
+    TOKEN_METADATA_PROGRAM
+  );
+  return pda;
+}
 
 function deriveMarketPdas(marketId: anchor.BN, programId: PublicKey) {
   const [marketPda, marketBump] = PublicKey.findProgramAddressSync(
@@ -72,7 +83,7 @@ describe("pm_amm", () => {
     const endTs = new anchor.BN(now + 86400 * 7);
 
     await program.methods
-      .initializeMarket(marketId, endTs)
+      .initializeMarket(marketId, endTs, "Test market", authority)
       .accounts({
         authority,
         market: pdas.marketPda,
@@ -80,14 +91,22 @@ describe("pm_amm", () => {
         yesMint: pdas.yesMint,
         noMint: pdas.noMint,
         vault: pdas.vault,
+        yesMetadata: metadataPdaForMint(pdas.yesMint),
+        noMetadata: metadataPdaForMint(pdas.noMint),
+        tokenMetadataProgram: TOKEN_METADATA_PROGRAM,
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
       .rpc();
 
     const market = await program.account.market.fetch(pdas.marketPda);
     assert.ok(market.authority.equals(authority));
+    assert.ok(
+      market.resolver.equals(authority),
+      "resolver should default to authority when explicit resolver arg matches authority",
+    );
     assert.equal(market.resolved, false);
 
     // Create user YES/NO token accounts (after init so mints exist)
@@ -492,24 +511,6 @@ describe("pm_amm", () => {
   });
 
   // ================================================================
-  // Sprint 7: resolve before end_ts → revert
-  // ================================================================
-  it("rejects resolve before end_ts", async () => {
-    try {
-      await program.methods
-        .resolveMarket({ yes: {} } as any)
-        .accounts({
-          signer: authority,
-          market: pdas.marketPda,
-        })
-        .rpc();
-      assert.fail("Should have thrown MarketNotExpired");
-    } catch (err) {
-      assert.include(err.toString(), "MarketNotExpired");
-    }
-  });
-
-  // ================================================================
   // Sprint 7: claim_winnings before resolve → revert
   // ================================================================
   it("rejects claim_winnings before resolve", async () => {
@@ -520,12 +521,15 @@ describe("pm_amm", () => {
           signer: authority,
           market: pdas.marketPda,
           collateralMint,
-          winningMint: pdas.yesMint,
+          yesMint: pdas.yesMint,
+          noMint: pdas.noMint,
           vault: pdas.vault,
-          userWinning: userYes,
+          userYes,
+          userNo,
           userCollateral: userUsdc,
           tokenProgram: TOKEN_PROGRAM_ID,
         })
+        .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
         .rpc();
       assert.fail("Should have thrown MarketNotResolved");
     } catch (err) {
@@ -534,7 +538,67 @@ describe("pm_amm", () => {
   });
 
   // ================================================================
-  // Sprint 7: resolve + claim_winnings (needs short-lived market)
+  // Sprint 7: early resolve (authority) + trading halted after resolve
+  // ================================================================
+  it("authority can resolve before end_ts", async () => {
+    assert.equal((await program.account.market.fetch(pdas.marketPda as any)).resolved, false);
+
+    await program.methods
+      .resolveMarket({ yes: {} } as any)
+      .accounts({
+        resolver: authority,
+        market: pdas.marketPda,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+      .rpc();
+
+    const m = await program.account.market.fetch(pdas.marketPda as any);
+    assert.equal(m.resolved, true);
+    assert.equal(m.winning_side, 1, "YES should be winning_side=1");
+  });
+
+  it("rejects swap after early resolve", async () => {
+    try {
+      await program.methods
+        .swap({ usdcToYes: {} } as any, new anchor.BN(1_000_000), new anchor.BN(0))
+        .accounts({
+          signer: authority,
+          market: pdas.marketPda,
+          collateralMint,
+          yesMint: pdas.yesMint,
+          noMint: pdas.noMint,
+          vault: pdas.vault,
+          userCollateral: userUsdc,
+          userYes,
+          userNo,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+        .rpc();
+      assert.fail("Should have thrown MarketAlreadyResolved");
+    } catch (err) {
+      assert.include(err.toString(), "MarketAlreadyResolved");
+    }
+  });
+
+  it("rejects second resolve (double resolve)", async () => {
+    try {
+      await program.methods
+        .resolveMarket({ no: {} } as any)
+        .accounts({
+          resolver: authority,
+          market: pdas.marketPda,
+        })
+        .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+        .rpc();
+      assert.fail("Should have thrown MarketAlreadyResolved");
+    } catch (err) {
+      assert.include(err.toString(), "MarketAlreadyResolved");
+    }
+  });
+
+  // ================================================================
+  // Sprint 7: second market — early resolve, claim, deposit blocked
   // ================================================================
   it("full lifecycle: init → deposit → resolve → claim_winnings", async () => {
     // Create a new market that expires in 1h01m (just over minimum)
@@ -544,7 +608,7 @@ describe("pm_amm", () => {
     const shortEnd = new anchor.BN(now + 3601); // 1h01m
 
     await program.methods
-      .initializeMarket(shortId, shortEnd)
+      .initializeMarket(shortId, shortEnd, "Short-lived resolve test", authority)
       .accounts({
         authority,
         market: shortPdas.marketPda,
@@ -552,10 +616,14 @@ describe("pm_amm", () => {
         yesMint: shortPdas.yesMint,
         noMint: shortPdas.noMint,
         vault: shortPdas.vault,
+        yesMetadata: metadataPdaForMint(shortPdas.yesMint),
+        noMetadata: metadataPdaForMint(shortPdas.noMint),
+        tokenMetadataProgram: TOKEN_METADATA_PROGRAM,
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
         rent: anchor.web3.SYSVAR_RENT_PUBKEY,
       })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
       .rpc();
 
     // Create YES/NO token accounts for this market
@@ -600,38 +668,172 @@ describe("pm_amm", () => {
     const yesBalance = Number((await getAccount(provider.connection, shortUserYes)).amount);
     assert.ok(yesBalance > 0, "Should have YES tokens");
 
-    // Warp past end_ts (localnet: we can't warp time, so this test
-    // verifies the error path. A real resolve test needs devnet or
-    // a clock manipulation. We already tested the revert above.)
-    // For now, verify the instruction compiles and accounts validate.
+    await program.methods
+      .resolveMarket({ yes: {} } as any)
+      .accounts({
+        resolver: authority,
+        market: shortPdas.marketPda,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+      .rpc();
 
-    // The resolve + claim happy path requires time warp which localnet
-    // doesn't support without a custom validator config.
-    // The Rust unit tests in accrual cover the math for expiration.
+    const resolvedM = await program.account.market.fetch(shortPdas.marketPda as any);
+    assert.equal(resolvedM.resolved, true);
+
+    try {
+      await program.methods
+        .depositLiquidity(new anchor.BN(1_000_000))
+        .accounts({
+          signer: authority,
+          market: shortPdas.marketPda,
+          collateralMint,
+          vault: shortPdas.vault,
+          userCollateral: userUsdc,
+          lpPosition: shortLp,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+        .rpc();
+      assert.fail("Should have thrown MarketAlreadyResolved");
+    } catch (err) {
+      assert.include(err.toString(), "MarketAlreadyResolved");
+    }
+
+    const usdcBefore = Number((await getAccount(provider.connection, userUsdc)).amount);
+
+    await program.methods
+      .claimWinnings(new anchor.BN(1))
+      .accounts({
+        signer: authority,
+        market: shortPdas.marketPda,
+        collateralMint,
+        yesMint: shortPdas.yesMint,
+        noMint: shortPdas.noMint,
+        vault: shortPdas.vault,
+        userYes: shortUserYes,
+        userNo: shortUserNo,
+        userCollateral: userUsdc,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+      .rpc();
+
+    const usdcAfter = Number((await getAccount(provider.connection, userUsdc)).amount);
+    assert.ok(usdcAfter > usdcBefore, "Claim should pay USDC to user");
   });
 
   // ================================================================
-  // Sprint 7: resolve by non-authority → revert
+  // Sprint 7: dedicated resolver may early-resolve
   // ================================================================
-  it("rejects resolve by non-authority", async () => {
-    // Use a different keypair as signer
+  it("market.resolver (non-authority) can resolve before end_ts", async () => {
+    const resolverKp = anchor.web3.Keypair.generate();
+    const sigA = await provider.connection.requestAirdrop(resolverKp.publicKey, 1_000_000_000);
+    await provider.connection.confirmTransaction(sigA);
+
+    const rid = new anchor.BN(1002);
+    const rpdas = deriveMarketPdas(rid, program.programId);
+    const nowR = Math.floor(Date.now() / 1000);
+    const endTsR = new anchor.BN(nowR + 86400 * 14);
+
+    await program.methods
+      .initializeMarket(rid, endTsR, "Resolver-only resolve test", resolverKp.publicKey)
+      .accounts({
+        authority,
+        market: rpdas.marketPda,
+        collateralMint,
+        yesMint: rpdas.yesMint,
+        noMint: rpdas.noMint,
+        vault: rpdas.vault,
+        yesMetadata: metadataPdaForMint(rpdas.yesMint),
+        noMetadata: metadataPdaForMint(rpdas.noMint),
+        tokenMetadataProgram: TOKEN_METADATA_PROGRAM,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+      .rpc();
+
+    const fetchedM = await program.account.market.fetch(rpdas.marketPda);
+    assert.ok(fetchedM.resolver.equals(resolverKp.publicKey));
+    assert.ok(fetchedM.authority.equals(authority));
+
+    const rlp = deriveLpPda(rpdas.marketPda, authority, program.programId);
+    await program.methods
+      .depositLiquidity(new anchor.BN(100_000_000))
+      .accounts({
+        signer: authority,
+        market: rpdas.marketPda,
+        collateralMint,
+        vault: rpdas.vault,
+        userCollateral: userUsdc,
+        lpPosition: rlp,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+      .rpc();
+
+    await program.methods
+      .resolveMarket({ yes: {} } as any)
+      .accounts({
+        resolver: resolverKp.publicKey,
+        market: rpdas.marketPda,
+      })
+      .signers([resolverKp])
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+      .rpc();
+
+    const resolvedM = await program.account.market.fetch(rpdas.marketPda);
+    assert.equal(resolvedM.resolved, true);
+  });
+
+  // ================================================================
+  // Sprint 7: random signer cannot early-resolve
+  // ================================================================
+  it("rejects early resolve by random signer (unrelated keypair)", async () => {
     const faker = anchor.web3.Keypair.generate();
-    // Airdrop SOL to faker
     const sig = await provider.connection.requestAirdrop(faker.publicKey, 1_000_000_000);
     await provider.connection.confirmTransaction(sig);
+
+    const fakerMarketId = new anchor.BN(1001);
+    const fakerPdas = deriveMarketPdas(fakerMarketId, program.programId);
+    const nowF = Math.floor(Date.now() / 1000);
+    const endTsF = new anchor.BN(nowF + 86400 * 7);
+
+    await program.methods
+      .initializeMarket(fakerMarketId, endTsF, "Faker early resolve test", authority)
+      .accounts({
+        authority,
+        market: fakerPdas.marketPda,
+        collateralMint,
+        yesMint: fakerPdas.yesMint,
+        noMint: fakerPdas.noMint,
+        vault: fakerPdas.vault,
+        yesMetadata: metadataPdaForMint(fakerPdas.yesMint),
+        noMetadata: metadataPdaForMint(fakerPdas.noMint),
+        tokenMetadataProgram: TOKEN_METADATA_PROGRAM,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
+      .rpc();
 
     try {
       await program.methods
         .resolveMarket({ yes: {} } as any)
         .accounts({
-          signer: faker.publicKey,
-          market: pdas.marketPda,
+          resolver: faker.publicKey,
+          market: fakerPdas.marketPda,
         })
         .signers([faker])
+        .preInstructions([ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 })])
         .rpc();
-      assert.fail("Should have thrown Unauthorized");
-    } catch (err) {
-      assert.include(err.toString(), "Unauthorized");
+      assert.fail("Should have thrown EarlyResolveUnauthorized");
+    } catch (err: unknown) {
+      assert.include(String(err), "EarlyResolveUnauthorized");
     }
   });
 });
