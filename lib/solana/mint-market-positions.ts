@@ -27,7 +27,7 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import { OUTCOME_MINT_DECIMALS } from "@/lib/solana/create-outcome-mints";
 
 export const MINT_POSITIONS_USDC_DECIMALS = 6;
@@ -380,7 +380,7 @@ export async function buildMintPositionsTransactionEngineSigned(params: {
   serialized: Uint8Array;
   outcomeMintAtoms: bigint;
 }> {
-  const usdcMint = params.usdcMint ?? DEVNET_USDC_MINT;
+  const usdcMint = params.usdcMint ?? getSparkUsdMint();
   const custodyOwner =
     params.custodyOwner ??
     getMintPositionsCustodyOwnerFromEnv() ??

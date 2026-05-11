@@ -1,5 +1,9 @@
 import { PublicKey } from "@solana/web3.js";
 
+import {
+  getSparkUsdMint,
+  tryGetSparkUsdMint,
+} from "@/lib/config/spark-usd";
 import { parseUsdcHumanToBaseUnits } from "@/lib/solana/mint-market-positions";
 
 /** Matt’s referenced public devnet program id ([Mattdgn/pm-amm](https://github.com/Mattdgn/pm-amm)). */
@@ -33,10 +37,9 @@ export const PMAMM_CONFIG = {
     process.env.NEXT_PUBLIC_PMAMM_PROGRAM_ID ??
       "11111111111111111111111111111111",
   ),
-  collateralMint: new PublicKey(
-    process.env.NEXT_PUBLIC_PMAMM_USDC_MINT ??
-      "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr",
-  ),
+  get collateralMint(): PublicKey {
+    return getPmammCollateralMint();
+  },
   cluster: "devnet" as const,
 };
 
@@ -54,7 +57,7 @@ export function requirePmammProgramId(): PublicKey {
 export const PMAMM_PROGRAM_NOT_ON_CLUSTER_MESSAGE =
   "pmAMM program not found on this cluster. Check program ID and RPC.";
 
-/** Default initial liquidity (human USDC) when the client omits `initialLiquidityUsdc`. */
+/** Default initial liquidity (human SparkUSD) when the client omits `initialLiquidityUsdc`. */
 export const PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN = "1000";
 
 /** `PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN` in base units (6 decimals). */
@@ -68,8 +71,10 @@ export const PMAMM_SEED_LIQUIDITY_USDC_ATOMS =
   PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_ATOMS;
 
 export function getPmammCollateralMint(): PublicKey {
-  const raw =
-    process.env.NEXT_PUBLIC_PMAMM_USDC_MINT?.trim() ??
-    "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr";
-  return new PublicKey(raw);
+  return getSparkUsdMint();
+}
+
+/** Client-safe: null when public env not loaded (SSR / tests). */
+export function tryGetPmammCollateralMint(): PublicKey | null {
+  return tryGetSparkUsdMint();
 }

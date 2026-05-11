@@ -13,6 +13,10 @@ import {
   pmammBuildSellOutcomeTransaction,
 } from "@/lib/engines/pmamm";
 import { parsePmammOutcomeHumanToAtoms } from "@/lib/solana/pmamm-amounts";
+import {
+  COLLATERAL_DISPLAY_LABEL,
+  collateralMintFromMarketRecord,
+} from "@/lib/config/spark-usd";
 import { getConnection } from "@/lib/solana/connection";
 import {
   buildResolvedWinnerRedeemTransactionEngineSigned,
@@ -45,7 +49,7 @@ async function loadLiveMarketRow(slug: string) {
   const { data: row, error } = await sb
     .from("markets")
     .select(
-      "slug,status,resolution_status,resolved_outcome,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
+      "slug,status,resolution_status,resolved_outcome,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine,usdc_mint",
     )
     .eq("slug", slug)
     .maybeSingle();
@@ -168,7 +172,7 @@ export async function GET(req: Request) {
         leftoverNoAtoms: "0",
         fallbackSwapAmountIn: atoms.toString(),
         fallbackOppositeMinOut: "0",
-        uiSummary: "pmAMM swap outcome → USDC.",
+        uiSummary: `pmAMM swap outcome → ${COLLATERAL_DISPLAY_LABEL}.`,
       };
       return NextResponse.json({ plan });
     }
@@ -202,6 +206,7 @@ export async function GET(req: Request) {
         noMint: new PublicKey(rec.no_mint!),
         outcomeAmountHuman,
         marketSlug: slug,
+        collateralMint: collateralMintFromMarketRecord(rec.usdc_mint),
       });
       const plan: SellOutcomePlan = {
         ...r,
@@ -211,6 +216,7 @@ export async function GET(req: Request) {
       return NextResponse.json({ plan });
     }
 
+    const gammCollateral = collateralMintFromMarketRecord(loaded.row.usdc_mint);
     const plan = await planSellOutcomeForUsdc({
       connection,
       user,
@@ -220,6 +226,7 @@ export async function GET(req: Request) {
       pairAddress: new PublicKey(loaded.row.pool_address),
       outcomeAmountHuman,
       marketSlug: slug,
+      collateralMint: gammCollateral,
     });
 
     return NextResponse.json({ plan });
@@ -400,6 +407,7 @@ export async function POST(req: Request) {
           poolAddress: new PublicKey(rec.pool_address!),
           outcomeAmountHuman,
           marketSlug: slug,
+          collateralMint: collateralMintFromMarketRecord(rec.usdc_mint),
         });
 
       console.info(
@@ -422,6 +430,7 @@ export async function POST(req: Request) {
       });
     }
 
+    const gammCollateral = collateralMintFromMarketRecord(row.usdc_mint);
     const { serialized, log, recentBlockhash, lastValidBlockHeight } =
       await buildSellOutcomeForUsdcTransactionEngineSigned({
         connection,
@@ -433,6 +442,7 @@ export async function POST(req: Request) {
         pairAddress: new PublicKey(row.pool_address!),
         outcomeAmountHuman,
         marketSlug: slug,
+        collateralMint: gammCollateral,
       });
 
     console.info(

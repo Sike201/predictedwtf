@@ -8,6 +8,8 @@ import { Plus, Search } from "lucide-react";
 import { motion } from "framer-motion";
 import { cn } from "@/lib/utils/cn";
 import { HowItWorksModal } from "@/components/layout/how-it-works-modal";
+import { SparkUsdClaimModal } from "@/components/spark-usd/spark-usd-claim-modal";
+import { tryGetSparkUsdMint } from "@/lib/config/spark-usd";
 import { WalletConnectButton } from "@/components/wallet/wallet-connect-button";
 import { WalletStatus } from "@/components/wallet/wallet-status";
 import { useWallet } from "@/lib/hooks/use-wallet";
@@ -27,11 +29,14 @@ export function TopNav({ className }: TopNavProps) {
   const searchPlaceholder =
     pathname === "/earn" ? "Search pools…" : "Search markets";
   const [howOpen, setHowOpen] = useState(false);
+  const [claimOpen, setClaimOpen] = useState(false);
   const [createExpanded, setCreateExpanded] = useState(false);
+  const sparkUsdConfigured = tryGetSparkUsdMint() != null;
 
   return (
     <>
       <HowItWorksModal open={howOpen} onClose={() => setHowOpen(false)} />
+      <SparkUsdClaimModal open={claimOpen} onClose={() => setClaimOpen(false)} />
       <header
         className={cn(
           "sticky top-0 z-30 bg-black/95 backdrop-blur-sm",
@@ -55,6 +60,20 @@ export function TopNav({ className }: TopNavProps) {
           </div>
 
           <div className="flex min-w-0 items-center justify-center gap-3 px-1 sm:gap-4">
+            {sparkUsdConfigured ? (
+              <button
+                type="button"
+                onClick={() => setClaimOpen(true)}
+                className={cn(
+                  "inline-flex h-8 shrink-0 items-center justify-center rounded-full px-3.5 text-[12px] font-semibold tracking-tight text-zinc-100",
+                  "bg-white/[0.07] ring-1 ring-inset ring-white/[0.08]",
+                  "transition-colors hover:bg-white/[0.12] hover:text-white hover:ring-white/[0.12]",
+                  "active:bg-white/[0.14] sm:px-4 sm:text-[13px]",
+                )}
+              >
+                Claim USD
+              </button>
+            ) : null}
             <Link
               href="/earn"
               className={cn(

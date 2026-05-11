@@ -19,7 +19,7 @@ export async function validatePmammCollateralMint(
   });
   if (info.decimals !== 6) {
     throw new Error(
-      `pmAMM requires USDC with 6 decimals; mint ${mint.toBase58()} has decimals=${info.decimals}.`,
+      `pmAMM collateral mint must have 6 decimals; mint ${mint.toBase58()} has decimals=${info.decimals}.`,
     );
   }
 }

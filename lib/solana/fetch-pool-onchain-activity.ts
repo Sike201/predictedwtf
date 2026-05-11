@@ -5,7 +5,7 @@ import bs58 from "bs58";
 import { Connection, PublicKey } from "@solana/web3.js";
 import type { ParsedTransactionWithMeta } from "@solana/web3.js";
 
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { gammCollateralMintStringsForMatching } from "@/lib/config/spark-usd";
 import { anchorDiscriminator } from "@/lib/solana/anchor-util";
 import { getOmnipairProgramId } from "@/lib/solana/omnipair-program";
 import { outcomeBaseUnitsToUsdcBaseUnits } from "@/lib/solana/mint-market-positions";
@@ -194,15 +194,16 @@ function firstSignerPubkey(tx: ParsedTransactionWithMeta): PublicKey | null {
 }
 
 /**
- * Devnet USDC leg: net USDC received by the fee payer (custody → user on sell redeem).
+ * Collateral leg (6 dp): net tokens received by the fee payer (custody → user on sell redeem).
  */
 function inferUsdcNetToFeePayerMicros(
   tx: ParsedTransactionWithMeta,
+  collateralMintB58: string,
 ): bigint {
   const payer = firstSignerPubkey(tx);
   if (!payer) return 0n;
   const payerStr = payer.toBase58();
-  const usdc = DEVNET_USDC_MINT.toBase58();
+  const usdc = collateralMintB58;
   const pre = tx.meta?.preTokenBalances ?? [];
   const post = tx.meta?.postTokenBalances ?? [];
   const indices = new Set<number>();
@@ -224,16 +225,17 @@ function inferUsdcNetToFeePayerMicros(
 }
 
 /**
- * USDC sent **from** the fee payer (user → custody on buy-with-USDC).
+ * Collateral sent **from** the fee payer (user → custody on buy-with-collateral).
  * Pairs with `inferUsdcNetToFeePayerMicros`; swap-ix parse can miss CPI layouts — custody notional still counts as volume.
  */
 function inferUsdcSentByFeePayerMicros(
   tx: ParsedTransactionWithMeta,
+  collateralMintB58: string,
 ): bigint {
   const payer = firstSignerPubkey(tx);
   if (!payer) return 0n;
   const payerStr = payer.toBase58();
-  const usdc = DEVNET_USDC_MINT.toBase58();
+  const usdc = collateralMintB58;
   const pre = tx.meta?.preTokenBalances ?? [];
   const post = tx.meta?.postTokenBalances ?? [];
   const indices = new Set<number>();
@@ -342,8 +344,15 @@ export function parseTradeVolumeUsdMicrosFromTx(
     return { micros: 0n, source: "bootstrap" };
   }
 
-  const usdcMicros = inferUsdcNetToFeePayerMicros(tx);
-  const usdcSentMicros = inferUsdcSentByFeePayerMicros(tx);
+  const collateralCandidates = gammCollateralMintStringsForMatching();
+  let usdcMicros = 0n;
+  let usdcSentMicros = 0n;
+  for (const m of collateralCandidates) {
+    const n0 = inferUsdcNetToFeePayerMicros(tx, m);
+    if (n0 > usdcMicros) usdcMicros = n0;
+    const n1 = inferUsdcSentByFeePayerMicros(tx, m);
+    if (n1 > usdcSentMicros) usdcSentMicros = n1;
+  }
   const pairedMicros = inferPairedOutcomeBurnUsdMicrosForFeePayer(
     tx,
     yesMint,

@@ -6,11 +6,12 @@ import { NextResponse } from "next/server";
 import { pmammBuildWithdrawLiquidityTransaction } from "@/lib/engines/pmamm";
 import { readPmammLpSnapshot } from "@/lib/solana/pmamm-read-lp";
 
-import { getSupabaseAdmin } from "@/lib/supabase/server-client";
+import { collateralMintFromMarketRecord } from "@/lib/config/spark-usd";
 import type { MarketRecord } from "@/lib/types/market-record";
 import { getConnection } from "@/lib/solana/connection";
 import { readOmnipairPoolState } from "@/lib/solana/read-omnipair-pool-state";
 import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
+import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import {
   buildWithdrawOmnipairLiquidityToUsdcTransactionEngineSigned,
   planWithdrawOmnipairLiquidityToUsdc,
@@ -88,7 +89,7 @@ export async function GET(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine,usdc_mint",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -201,6 +202,9 @@ export async function GET(req: Request) {
       marketSlug: slug,
       liquidityHuman,
       lpDecimals,
+      collateralMint: collateralMintFromMarketRecord(
+        (row as MarketRecord).usdc_mint,
+      ),
     });
 
     return NextResponse.json({ plan, removeLog });
@@ -250,7 +254,7 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine,usdc_mint",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -400,6 +404,9 @@ export async function POST(req: Request) {
         marketSlug: slug,
         liquidityHuman: liquidityHuman || undefined,
         lpDecimals,
+        collateralMint: collateralMintFromMarketRecord(
+          (row as MarketRecord).usdc_mint,
+        ),
       });
 
     console.info(

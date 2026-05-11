@@ -48,7 +48,7 @@
  * ```
  *
  * Our prediction markets use a **binary Outcome pair** whose `token0` / `token1` are the **YES and NO outcome mints**.
- * Devnet USDC (`Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr`) is **not** `pair.token0` or `pair.token1`, and there is **no**
+ * Platform collateral (`SparkUSD` / `NEXT_PUBLIC_COLLATERAL_MINT`) is **not** `pair.token0` or `pair.token1`, and there is **no**
  * USDC reserve vault registered on that pair. Therefore:
  * - You **cannot** `borrow` USDC through Omnipair on that pair.
  * - You **cannot** `repay` USDC debt through Omnipair on that pair.

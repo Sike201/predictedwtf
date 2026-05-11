@@ -5,6 +5,7 @@ import { NextResponse } from "next/server";
 import { pmammBuildDepositLiquidityUserTransaction } from "@/lib/engines/pmamm";
 import { buildProvideLiquidityWithUsdcTransactionEngineSigned } from "@/lib/solana/provide-liquidity-usdc";
 import { parseUsdcHumanToBaseUnits } from "@/lib/solana/mint-market-positions";
+import { collateralMintFromMarketRecord } from "@/lib/config/spark-usd";
 import { getConnection } from "@/lib/solana/connection";
 import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
 import {
@@ -59,7 +60,7 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,market_engine,usdc_mint",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -94,7 +95,7 @@ export async function POST(req: Request) {
     const usdcAtoms = parseUsdcHumanToBaseUnits(usdcAmountHuman);
     if (usdcAtoms <= 0n) {
       return NextResponse.json(
-        { error: "Enter a devnet USDC amount greater than zero" },
+        { error: "Enter a SparkUSD amount greater than zero" },
         { status: 400 },
       );
     }
@@ -182,6 +183,7 @@ export async function POST(req: Request) {
         pairAddress,
         usdcAmountAtoms: usdcAtoms,
         marketSlug: slug,
+        collateralMint: collateralMintFromMarketRecord(rec.usdc_mint),
       });
 
     console.info(

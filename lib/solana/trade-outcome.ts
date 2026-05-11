@@ -13,7 +13,7 @@ import {
 } from "@solana/spl-token";
 
 import type { Market } from "@/lib/types/market";
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import {
   decodeFutarchySwapShareBps,
   decodeOmnipairPairAccount,
@@ -262,7 +262,7 @@ export async function executeOmnipairOutcomeTrade(
     connection,
     publicKey,
     publicKey,
-    DEVNET_USDC_MINT,
+    getSparkUsdMint(),
   );
   if (ixUsdc) tx.add(ixUsdc);
 
@@ -297,7 +297,7 @@ export async function executeOmnipairOutcomeTrade(
   const userUsdcAta = await deriveUserAta(
     connection,
     publicKey,
-    DEVNET_USDC_MINT,
+    getSparkUsdMint(),
   );
 
   const balancesAfter = {

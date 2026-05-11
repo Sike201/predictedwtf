@@ -13,7 +13,7 @@ import {
   VersionedTransaction,
 } from "@solana/web3.js";
 
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import {
   decodeFutarchySwapShareBps,
   decodeOmnipairPairAccount,
@@ -102,6 +102,7 @@ export async function simulatePreviewLeverageYesFromUsdc(params: {
    * so borrow sizing uses the exact collateral atoms that the submit tx will use.
    */
   mintPart?: MintPositionsInstructionsResult;
+  collateralMint?: PublicKey;
 }): Promise<LeveragePreviewYesResult> {
   const programId = requireOmnipairProgramId();
   const layout = deriveOmnipairLayout(
@@ -124,7 +125,7 @@ export async function simulatePreviewLeverageYesFromUsdc(params: {
         custodyOwner: params.engine.publicKey,
         yesMint: params.yesMint,
         noMint: params.noMint,
-        usdcMint: DEVNET_USDC_MINT,
+        usdcMint: params.collateralMint ?? getSparkUsdMint(),
         usdcAmountAtoms: params.usdcAmountAtoms,
       },
       { skipUsdcBalanceCheck: params.skipUsdcBalanceCheck ?? false },
@@ -290,6 +291,7 @@ export async function simulatePreviewLeverageNoFromUsdc(params: {
   slippageBps: number;
   skipUsdcBalanceCheck?: boolean;
   mintPart?: MintPositionsInstructionsResult;
+  collateralMint?: PublicKey;
 }): Promise<LeveragePreviewNoResult> {
   const programId = requireOmnipairProgramId();
   const layout = deriveOmnipairLayout(
@@ -312,7 +314,7 @@ export async function simulatePreviewLeverageNoFromUsdc(params: {
         custodyOwner: params.engine.publicKey,
         yesMint: params.yesMint,
         noMint: params.noMint,
-        usdcMint: DEVNET_USDC_MINT,
+        usdcMint: params.collateralMint ?? getSparkUsdMint(),
         usdcAmountAtoms: params.usdcAmountAtoms,
       },
       { skipUsdcBalanceCheck: params.skipUsdcBalanceCheck ?? false },
@@ -476,6 +478,7 @@ export async function buildLeverageYesFromUsdcTransactionEngineSigned(params: {
   usdcAmountAtoms: bigint;
   slippageBps: number;
   leverageSlider01?: number;
+  collateralMint?: PublicKey;
 }): Promise<{
   transaction: Transaction;
   log: Record<string, string>;
@@ -489,7 +492,7 @@ export async function buildLeverageYesFromUsdcTransactionEngineSigned(params: {
     custodyOwner: params.engine.publicKey,
     yesMint: params.yesMint,
     noMint: params.noMint,
-    usdcMint: DEVNET_USDC_MINT,
+    usdcMint: params.collateralMint ?? getSparkUsdMint(),
     usdcAmountAtoms: params.usdcAmountAtoms,
   });
 
@@ -504,6 +507,7 @@ export async function buildLeverageYesFromUsdcTransactionEngineSigned(params: {
     leverageSlider01: params.leverageSlider01 ?? 1,
     slippageBps: params.slippageBps,
     mintPart,
+    collateralMint: params.collateralMint,
   });
 
   if (process.env.NODE_ENV !== "production") {
@@ -581,6 +585,7 @@ export async function buildLeverageNoFromUsdcTransactionEngineSigned(params: {
   usdcAmountAtoms: bigint;
   slippageBps: number;
   leverageSlider01?: number;
+  collateralMint?: PublicKey;
 }): Promise<{
   transaction: Transaction;
   log: Record<string, string>;
@@ -594,7 +599,7 @@ export async function buildLeverageNoFromUsdcTransactionEngineSigned(params: {
     custodyOwner: params.engine.publicKey,
     yesMint: params.yesMint,
     noMint: params.noMint,
-    usdcMint: DEVNET_USDC_MINT,
+    usdcMint: params.collateralMint ?? getSparkUsdMint(),
     usdcAmountAtoms: params.usdcAmountAtoms,
   });
 
@@ -609,6 +614,7 @@ export async function buildLeverageNoFromUsdcTransactionEngineSigned(params: {
     leverageSlider01: params.leverageSlider01 ?? 1,
     slippageBps: params.slippageBps,
     mintPart,
+    collateralMint: params.collateralMint,
   });
 
   if (process.env.NODE_ENV !== "production") {

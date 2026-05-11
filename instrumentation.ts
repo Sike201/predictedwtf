@@ -2,9 +2,20 @@
  * Next.js server startup — logs resolver env at boot (public keys only, no secrets).
  * Next loads `.env.local` before this runs (see https://nextjs.org/docs/app/building-your-application/configuring/environment-variables).
  */
+import { assertSparkUsdDevBoot } from "@/lib/config/spark-usd-boot";
 import { deriveTrustedResolverSecretPublicKey } from "@/lib/solana/treasury";
 
 export async function register(): Promise<void> {
+  try {
+    await assertSparkUsdDevBoot();
+  } catch (e) {
+    if (process.env.NODE_ENV === "development") {
+      console.error("[predicted][spark-usd-boot] validation failed:", e);
+      throw e;
+    }
+    console.error("[predicted][spark-usd-boot] validation skipped or failed:", e);
+  }
+
   const trustedResolverSecretPubkey = deriveTrustedResolverSecretPublicKey();
   const trustedResolverAddress = process.env.TRUSTED_RESOLVER_ADDRESS?.trim();
   const trustedResolverSecretMatches =

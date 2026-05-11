@@ -363,7 +363,7 @@ export async function POST(req: Request) {
     const usdcAtoms = parseUsdcHumanToBaseUnits(usdcAmountHuman);
     if (usdcAtoms <= 0n) {
       return NextResponse.json(
-        { error: "Enter a devnet USDC amount greater than zero" },
+        { error: "Enter a SparkUSD amount greater than zero" },
         { status: 400 },
       );
     }

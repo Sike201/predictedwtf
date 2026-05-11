@@ -29,7 +29,7 @@ import {
   type SellOutcomeForUsdcBuildLog,
   type SellOutcomePlan,
 } from "@/lib/solana/sell-outcome-for-usdc";
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import {
   floorOutcomeToUsdcRedemptionGrid,
   getMintPositionsCustodyOwnerFromEnv,
@@ -102,6 +102,7 @@ async function readOutcomeBal(
 
 async function readCustodyUsdcAtoms(
   connection: Connection,
+  collateralMint: PublicKey,
 ): Promise<{ custodyOwner: string; atoms: bigint }> {
   const custodyOwnerPk =
     getMintPositionsCustodyOwnerFromEnv() ??
@@ -110,7 +111,7 @@ async function readCustodyUsdcAtoms(
     return { custodyOwner: "", atoms: 0n };
   }
   const ata = getAssociatedTokenAddressSync(
-    DEVNET_USDC_MINT,
+    collateralMint,
     custodyOwnerPk,
     false,
     TOKEN_PROGRAM_ID,
@@ -264,6 +265,7 @@ async function computeWithdrawToUsdcSellPlanningArgs(params: {
   liquidityIn: bigint;
   slippageBps: number;
   removeBundle?: RemoveIxBundle;
+  collateralMint?: PublicKey;
 }): Promise<{
   rd: Awaited<ReturnType<typeof fetchRedemptionMintDecimals>>;
   proj: Awaited<ReturnType<typeof projectedBalancesAfterRemove>>;
@@ -271,11 +273,13 @@ async function computeWithdrawToUsdcSellPlanningArgs(params: {
   cap: bigint;
   side: "yes" | "no";
 }> {
+  const collateralMint = params.collateralMint ?? getSparkUsdMint();
   const [rd, proj] = await Promise.all([
     fetchRedemptionMintDecimals(
       params.connection,
       params.yesMint,
       params.noMint,
+      collateralMint,
     ),
     projectedBalancesAfterRemove(
       {
@@ -323,14 +327,20 @@ export async function planWithdrawOmnipairLiquidityToUsdc(params: {
   /** Preview logging only */
   liquidityHuman?: string;
   lpDecimals?: number;
+  collateralMint?: PublicKey;
 }): Promise<{
   plan: SellOutcomePlan;
   removeLog: WithdrawOmnipairLiquidityBuildLog;
 }> {
   const slippageBps = params.slippageBps ?? 100;
+  const collateralMint = params.collateralMint ?? getSparkUsdMint();
   const [sellArgs, custody] = await Promise.all([
-    computeWithdrawToUsdcSellPlanningArgs({ ...params, slippageBps }),
-    readCustodyUsdcAtoms(params.connection),
+    computeWithdrawToUsdcSellPlanningArgs({
+      ...params,
+      slippageBps,
+      collateralMint,
+    }),
+    readCustodyUsdcAtoms(params.connection, collateralMint),
   ]);
   const { rd, proj, outcomeBalances, cap, side } = sellArgs;
 
@@ -347,6 +357,7 @@ export async function planWithdrawOmnipairLiquidityToUsdc(params: {
     capOutcomeAtoms: cap,
     pairDecodedForSwap: proj.pairForSwap,
     redemptionMintDecimals: rd,
+    collateralMint,
   });
 
   const yesAdd = proj.expectedYesFromRemove;
@@ -468,6 +479,7 @@ export async function buildWithdrawOmnipairLiquidityToUsdcTransactionEngineSigne
   /** Debug logging only */
   liquidityHuman?: string;
   lpDecimals?: number;
+  collateralMint?: PublicKey;
 }): Promise<{
   serialized: Uint8Array;
   log: WithdrawLpToUsdcBuildLog;
@@ -475,6 +487,7 @@ export async function buildWithdrawOmnipairLiquidityToUsdcTransactionEngineSigne
   lastValidBlockHeight: number;
 }> {
   const slippageBps = params.slippageBps ?? 100;
+  const collateralMint = params.collateralMint ?? getSparkUsdMint();
   const removeBundle = await buildOmnipairRemoveLiquidityIxForUser({
     connection: params.connection,
     user: params.user,
@@ -512,6 +525,7 @@ export async function buildWithdrawOmnipairLiquidityToUsdcTransactionEngineSigne
     liquidityIn: params.liquidityIn,
     slippageBps,
     removeBundle,
+    collateralMint,
   });
   const { rd, proj, outcomeBalances, cap, side } = sellArgs;
 
@@ -554,6 +568,7 @@ export async function buildWithdrawOmnipairLiquidityToUsdcTransactionEngineSigne
     pairDecodedForSwap: proj.pairForSwap,
     skipComputeBudgetInstruction: true,
     redemptionMintDecimals: rd,
+    collateralMint,
   });
 
   console.info(

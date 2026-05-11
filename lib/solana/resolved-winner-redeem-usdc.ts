@@ -20,7 +20,7 @@ import {
   Transaction,
 } from "@solana/web3.js";
 
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import { OUTCOME_MINT_DECIMALS } from "@/lib/solana/create-outcome-mints";
 import {
   floorOutcomeAtomsToRedemptionGrid,
@@ -40,9 +40,10 @@ const ATOMS_GRID =
 async function maybeCreateUserUsdcAtaIx(
   connection: Connection,
   user: PublicKey,
+  collateralMint: PublicKey,
 ): Promise<import("@solana/web3.js").TransactionInstruction | null> {
   const ata = getAssociatedTokenAddressSync(
-    DEVNET_USDC_MINT,
+    collateralMint,
     user,
     false,
     TOKEN_PROGRAM_ID,
@@ -54,7 +55,7 @@ async function maybeCreateUserUsdcAtaIx(
     user,
     ata,
     user,
-    DEVNET_USDC_MINT,
+    collateralMint,
     TOKEN_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
@@ -97,6 +98,8 @@ type CoreParams = {
   outcomeAmountHuman: string;
   marketSlug?: string;
   engine: Keypair | null;
+  /** GAMM custody collateral mint. */
+  collateralMint?: PublicKey;
 };
 
 function logResolvedSettlement(payload: Record<string, unknown>) {
@@ -164,6 +167,8 @@ export async function planResolvedWinnerRedeem(
     marketSlug,
   } = p;
 
+  const collateralMint = p.collateralMint ?? getSparkUsdMint();
+
   if (side !== winningOutcome) {
     throw new Error(
       "After resolution, only the winning outcome can be redeemed for USDC. The losing side has no value.",
@@ -179,7 +184,7 @@ export async function planResolvedWinnerRedeem(
   }
 
   const custodyUsdcAta = getAssociatedTokenAddressSync(
-    DEVNET_USDC_MINT,
+    collateralMint,
     custodyOwner,
     false,
     TOKEN_PROGRAM_ID,
@@ -283,6 +288,7 @@ export async function buildResolvedWinnerRedeemTransactionEngineSigned(
     noMint: params.noMint,
     outcomeAmountHuman: params.outcomeAmountHuman,
     marketSlug: params.marketSlug,
+    collateralMint: params.collateralMint,
   });
   const burnAtoms = BigInt(plan.winningBurnOutcomeAtoms);
   const usdcOut = BigInt(plan.usdcOutAtoms);
@@ -299,6 +305,8 @@ export async function buildResolvedWinnerRedeemTransactionEngineSigned(
     );
   }
 
+  const collateralMint = params.collateralMint ?? getSparkUsdMint();
+
   const winMint = side === "yes" ? yesMint : noMint;
   const userWinAta = getAssociatedTokenAddressSync(
     winMint,
@@ -308,14 +316,14 @@ export async function buildResolvedWinnerRedeemTransactionEngineSigned(
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
   const userUsdcAta = getAssociatedTokenAddressSync(
-    DEVNET_USDC_MINT,
+    collateralMint,
     user,
     false,
     TOKEN_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
   const custodyUsdcAta = getAssociatedTokenAddressSync(
-    DEVNET_USDC_MINT,
+    collateralMint,
     custodyOwner,
     false,
     TOKEN_PROGRAM_ID,
@@ -326,7 +334,11 @@ export async function buildResolvedWinnerRedeemTransactionEngineSigned(
   const ixs: import("@solana/web3.js").TransactionInstruction[] = [
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports }),
   ];
-  const ixUserUsdc = await maybeCreateUserUsdcAtaIx(connection, user);
+  const ixUserUsdc = await maybeCreateUserUsdcAtaIx(
+    connection,
+    user,
+    collateralMint,
+  );
   if (ixUserUsdc) ixs.push(ixUserUsdc);
   ixs.push(
     createBurnInstruction(

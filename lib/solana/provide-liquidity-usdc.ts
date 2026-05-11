@@ -17,7 +17,7 @@ import {
   getMint,
 } from "@solana/spl-token";
 
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import { decodeOmnipairPairAccount } from "@/lib/solana/decode-omnipair-accounts";
 import {
   buildMintPositionsInstructions,
@@ -68,6 +68,7 @@ export async function buildProvideLiquidityWithUsdcTransactionEngineSigned(param
   noMint: PublicKey;
   pairAddress: PublicKey;
   usdcAmountAtoms: bigint;
+  collateralMint?: PublicKey;
   marketSlug?: string;
   slippageBps?: number;
 }): Promise<{
@@ -94,6 +95,8 @@ export async function buildProvideLiquidityWithUsdcTransactionEngineSigned(param
     getMintPositionsCustodyOwnerFromEnv() ?? params.engine.publicKey;
   const mintAuthority = params.engine.publicKey;
 
+  const collateralMint = params.collateralMint ?? getSparkUsdMint();
+
   const mintPart = await buildMintPositionsInstructions({
     connection: params.connection,
     user: params.user,
@@ -101,7 +104,7 @@ export async function buildProvideLiquidityWithUsdcTransactionEngineSigned(param
     custodyOwner,
     yesMint: params.yesMint,
     noMint: params.noMint,
-    usdcMint: DEVNET_USDC_MINT,
+    usdcMint: collateralMint,
     usdcAmountAtoms: params.usdcAmountAtoms,
   });
 

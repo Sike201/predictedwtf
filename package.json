@@ -16,7 +16,9 @@
     "backfill:chart": "tsx scripts/backfill-chart-history.ts",
     "pmamm:test-init": "tsx scripts/pmamm/test-init-matt-program.ts",
     "pmamm:sim-current": "tsx scripts/pmamm/simulate-initialize-current.ts",
-    "pmamm:smoke-airdrop": "tsx scripts/pmamm/simulate-matt-initialize.ts"
+    "pmamm:smoke-airdrop": "tsx scripts/pmamm/simulate-matt-initialize.ts",
+    "verify:spark-usd": "tsx scripts/verify-spark-usd.ts",
+    "spark:create-mint": "tsx scripts/create-spark-usd-mint.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",

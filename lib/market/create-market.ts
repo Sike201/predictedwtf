@@ -55,7 +55,7 @@ import {
 } from "@/lib/market/trusted-resolver";
 import type { MarketRecord, MarketStatus } from "@/lib/types/market-record";
 import type { MarketDraft, MarketEngine } from "@/lib/types/market";
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import {
   createPmammProgram,
   fetchPmammMarketAccount,
@@ -526,7 +526,7 @@ export async function createMarketPipeline(
       if (!treasury) {
         throw new PipelineStageError(
           "FAILED_AT_PRECONDITION",
-          "Set MARKET_ENGINE_AUTHORITY_SECRET (pmAMM market authority).",
+          "Set MARKET_ENGINE_AUTHORITY_SECRET (pmAMM market authority), or TRUSTED_RESOLVER_SECRET in development when it matches your configured resolver.",
         );
       }
       const collateralMintPk = getPmammCollateralMint();
@@ -784,7 +784,7 @@ export async function createMarketPipeline(
         let msg = formatUnknownError(e);
         if (isSplTokenInsufficientFundsMessage(diag)) {
           msg =
-            "Insufficient USDC in the creator wallet to build the initial liquidity deposit.";
+            "Insufficient SparkUSD in the creator wallet to build the initial liquidity deposit.";
         } else if (isNativeSolInsufficientMessage(diag)) {
           msg =
             "Not enough SOL in the creator wallet to pay fees for the liquidity deposit.";
@@ -859,7 +859,7 @@ export async function createMarketPipeline(
       if (!treasury) {
         throw new PipelineStageError(
           "FAILED_AT_PRECONDITION",
-          "Set MARKET_ENGINE_AUTHORITY_SECRET for server-side minting and pool setup.",
+          "Set MARKET_ENGINE_AUTHORITY_SECRET for server-side minting and pool setup, or TRUSTED_RESOLVER_SECRET in development.",
         );
       }
       if (process.env.OMNIPAIR_EXECUTE_INIT !== "true") {
@@ -1014,7 +1014,7 @@ export async function createMarketPipeline(
             omnipairProgramPk ?? getOmnipairProgramId()
           ).toBase58(),
           pmamm_market_address: null,
-          usdc_mint: DEVNET_USDC_MINT.toBase58(),
+          usdc_mint: getSparkUsdMint().toBase58(),
           pmamm_market_id: pmammMarketIdStr,
         })
         .eq("id", marketId)

@@ -21,7 +21,7 @@ import {
   type TransactionInstruction,
 } from "@solana/web3.js";
 
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { COLLATERAL_DISPLAY_LABEL, getSparkUsdMint } from "@/lib/config/spark-usd";
 import {
   decodeFutarchySwapShareBps,
   decodeOmnipairPairAccount,
@@ -118,11 +118,12 @@ export async function fetchRedemptionMintDecimals(
   connection: Connection,
   yesMint: PublicKey,
   noMint: PublicKey,
+  collateralMint: PublicKey = getSparkUsdMint(),
 ): Promise<RedemptionMintDecimals> {
   const [yesM, noM, usdcM] = await Promise.all([
     getMint(connection, yesMint, "confirmed"),
     getMint(connection, noMint, "confirmed"),
-    getMint(connection, DEVNET_USDC_MINT, "confirmed"),
+    getMint(connection, collateralMint, "confirmed"),
   ]);
   if (yesM.decimals !== noM.decimals) {
     throw new Error(
@@ -183,9 +184,10 @@ async function readUsdcBal(
 async function maybeCreateUserUsdcAtaIx(
   connection: Connection,
   user: PublicKey,
+  collateralMint: PublicKey,
 ): Promise<TransactionInstruction | null> {
   const ata = getAssociatedTokenAddressSync(
-    DEVNET_USDC_MINT,
+    collateralMint,
     user,
     false,
     TOKEN_PROGRAM_ID,
@@ -197,7 +199,7 @@ async function maybeCreateUserUsdcAtaIx(
     user,
     ata,
     user,
-    DEVNET_USDC_MINT,
+    collateralMint,
     TOKEN_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID,
   );
@@ -367,9 +369,9 @@ function uiSummaryForUsdc(params: {
   cap: bigint;
 }): string {
   if (params.routeKind === "partial_usdc_exit") {
-    return "Partially exited to USDC. Remaining position left in outcome tokens.";
+    return `Partially exited to ${COLLATERAL_DISPLAY_LABEL}. Remaining position left in outcome tokens.`;
   }
-  return "Full exit to devnet USDC at the current redemption grid.";
+  return `Full exit to ${COLLATERAL_DISPLAY_LABEL} at the current redemption grid.`;
 }
 
 export type PlanSellOutcomeParams = {
@@ -380,6 +382,8 @@ export type PlanSellOutcomeParams = {
   noMint: PublicKey;
   pairAddress: PublicKey;
   outcomeAmountHuman: string;
+  /** GAMM custody collateral (SparkUSD or legacy per `markets.usdc_mint`). */
+  collateralMint?: PublicKey;
   marketSlug?: string;
   slippageBps?: number;
 };
@@ -451,10 +455,12 @@ async function computeSellOutcomeCore(params: {
   outcomeAmountHuman: string;
   marketSlug?: string;
   slippageBps?: number;
+  collateralMint?: PublicKey;
   /** Return redeem instructions only (for composing with remove_liquidity in one tx). */
   composeOnly?: boolean;
 } & Partial<SellOutcomeExplicitBalancesParams>): Promise<ComputeCoreResult> {
   const slippageBps = params.slippageBps ?? 100;
+  const collateralMint = params.collateralMint ?? getSparkUsdMint();
   const rd = params.redemptionMintDecimals;
   const floorFn = (a: bigint) => floorRedemptionGrid(a, rd);
   const programId = requireOmnipairProgramId();
@@ -488,9 +494,9 @@ async function computeSellOutcomeCore(params: {
 
   const userYesAta = await outcomeAta(params.user, params.yesMint);
   const userNoAta = await outcomeAta(params.user, params.noMint);
-  const userUsdcAta = await outcomeAta(params.user, DEVNET_USDC_MINT);
+  const userUsdcAta = await outcomeAta(params.user, collateralMint);
   const custodyUsdcAta = getAssociatedTokenAddressSync(
-    DEVNET_USDC_MINT,
+    collateralMint,
     custodyOwner,
     false,
     TOKEN_PROGRAM_ID,
@@ -834,6 +840,7 @@ async function computeSellOutcomeCore(params: {
   const ixUserUsdc = await maybeCreateUserUsdcAtaIx(
     params.connection,
     params.user,
+    collateralMint,
   );
   if (routeKind !== "fallback_pool_swap") {
     if (ixUserUsdc) ixs.push(ixUserUsdc);
@@ -979,6 +986,7 @@ export async function buildSellOutcomeForUsdcTransactionEngineSigned(params: {
   noMint: PublicKey;
   pairAddress: PublicKey;
   outcomeAmountHuman: string;
+  collateralMint?: PublicKey;
   marketSlug?: string;
   slippageBps?: number;
 }): Promise<{
@@ -1010,6 +1018,7 @@ export async function planSellOutcomePairedRedeemFromSnapshot(
     pairAddress: PublicKey;
     marketSlug?: string;
     slippageBps?: number;
+    collateralMint?: PublicKey;
   } & SellOutcomeExplicitBalancesParams,
 ): Promise<SellOutcomePlan> {
   const { log } = await computeSellOutcomeCore({
@@ -1047,6 +1056,7 @@ export async function buildSellOutcomePairedRedeemTransactionEngineSignedFromSna
     pairAddress: PublicKey;
     marketSlug?: string;
     slippageBps?: number;
+    collateralMint?: PublicKey;
   } & SellOutcomeExplicitBalancesParams,
 ): Promise<{
   serialized: Uint8Array;
@@ -1081,6 +1091,7 @@ export async function buildSellOutcomePairedRedeemInstructionsFromSnapshot(
     pairAddress: PublicKey;
     marketSlug?: string;
     slippageBps?: number;
+    collateralMint?: PublicKey;
   } & SellOutcomeExplicitBalancesParams,
 ): Promise<{
   instructions: TransactionInstruction[];

@@ -7,7 +7,7 @@ import {
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
 
-import { DEVNET_USDC_MINT } from "@/lib/solana/assets";
+import { getSparkUsdMint } from "@/lib/config/spark-usd";
 import { TOKEN_2022_PROGRAM_ID } from "@/lib/solana/omnipair-constants";
 
 async function splProgramForMint(
@@ -64,7 +64,7 @@ export async function readUsdcBalance(
   connection: Connection,
   owner: PublicKey,
 ): Promise<{ raw: bigint; decimals: number }> {
-  return readWalletTokenBalance(connection, owner, DEVNET_USDC_MINT);
+  return readWalletTokenBalance(connection, owner, getSparkUsdMint());
 }
 
 /** Trim trailing zeros after decimal point. */

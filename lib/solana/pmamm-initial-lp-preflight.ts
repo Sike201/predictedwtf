@@ -7,9 +7,10 @@ import {
   getAccount,
 } from "@solana/spl-token";
 
+import { COLLATERAL_DISPLAY_LABEL } from "@/lib/config/spark-usd";
 import { PipelineStageError } from "@/lib/market/pipeline-errors";
 
-/** Human-readable USDC (or other fixed-decimal collateral) for UI and errors. */
+/** Human-readable collateral (or other fixed-decimal SPL) for UI and errors. */
 export function formatPmammCollateralHuman(
   amountAtoms: bigint,
   decimals: number,
@@ -87,7 +88,7 @@ export async function preflightPmammInitialLpUsdc(params: {
         ? "CREATOR_WALLET (connected user — signs initial LP deposit)"
         : role;
 
-  console.info("[predicted][pmamm] initial LP USDC preflight", {
+  console.info("[predicted][pmamm] initial LP collateral preflight", {
     pmammUsdcMint: collateralMint.toBase58(),
     collateralDecimals,
     initialLpDepositorRole: roleLabel,
@@ -107,8 +108,8 @@ export async function preflightPmammInitialLpUsdc(params: {
     });
     const msg =
       role === "CREATOR_WALLET"
-        ? `You need ${need} USDC, but your wallet has ${have} USDC.`
-        : `Initial LP wallet needs ${need} USDC, but only has ${have} USDC.`;
+        ? `You need ${need} ${COLLATERAL_DISPLAY_LABEL}, but your wallet has ${have} ${COLLATERAL_DISPLAY_LABEL}.`
+        : `Initial LP wallet needs ${need} ${COLLATERAL_DISPLAY_LABEL}, but only has ${have} ${COLLATERAL_DISPLAY_LABEL}.`;
     throw new PipelineStageError("FAILED_AT_PRECONDITION", msg);
   }
 }

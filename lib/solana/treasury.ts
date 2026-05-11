@@ -3,32 +3,109 @@ import { Keypair } from "@solana/web3.js";
 
 import { TRUSTED_RESOLVER_ADDRESS } from "@/lib/market/trusted-resolver";
 
+function parseKeypairSecret(raw: string): Keypair {
+  if (raw.startsWith("[")) {
+    const arr = JSON.parse(raw) as number[];
+    return Keypair.fromSecretKey(Uint8Array.from(arr));
+  }
+  return Keypair.fromSecretKey(bs58.decode(raw));
+}
+
+/** `NODE_ENV === "production"` disables trusted-resolver fallback for market-style authority. */
+function isProductionNodeEnv(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+export type EffectiveMarketAuthoritySource = "market_engine" | "trusted_resolver";
+
 /**
- * Hot wallet used only by the server to mint outcomes, initialize pools, and seed demo liquidity.
- * Set `MARKET_ENGINE_AUTHORITY_SECRET` — JSON array of 64 bytes or base58-encoded secret key.
+ * Effective server signer for market-engine-style operations (init, custody, faucet when unset).
+ *
+ * Priority:
+ * 1. `MARKET_ENGINE_AUTHORITY_SECRET` (when present and parses)
+ * 2. `TRUSTED_RESOLVER_SECRET` — only when **not** in production (local dev, tests, `tsx` scripts).
+ *
+ * In production, only a valid market engine secret is returned; trusted resolver is never used here.
  */
-export function loadMarketEngineAuthority(): Keypair | null {
+export function loadEffectiveMarketAuthoritySigner(): {
+  signer: Keypair;
+  source: EffectiveMarketAuthoritySource;
+} | null {
   const raw = process.env.MARKET_ENGINE_AUTHORITY_SECRET?.trim();
-  if (!raw) return null;
-  try {
-    if (raw.startsWith("[")) {
-      const arr = JSON.parse(raw) as number[];
-      return Keypair.fromSecretKey(Uint8Array.from(arr));
+  if (raw) {
+    try {
+      return {
+        signer: parseKeypairSecret(raw),
+        source: "market_engine",
+      };
+    } catch {
+      if (isProductionNodeEnv()) {
+        return null;
+      }
+      console.warn(
+        "[predicted][authority-fallback] MARKET_ENGINE_AUTHORITY_SECRET could not be parsed; trying TRUSTED_RESOLVER_SECRET.",
+      );
     }
-    return Keypair.fromSecretKey(bs58.decode(raw));
-  } catch {
+  }
+
+  if (isProductionNodeEnv()) {
     return null;
   }
+
+  const trusted = loadTrustedResolverSigner();
+  if (!trusted) return null;
+  return { signer: trusted, source: "trusted_resolver" };
+}
+
+/**
+ * Hot wallet for server-side engine operations (mint outcomes, pool init, demo seed, etc.).
+ *
+ * - **Production:** `MARKET_ENGINE_AUTHORITY_SECRET` only.
+ * - **Non-production:** {@link loadEffectiveMarketAuthoritySigner} (market engine, else trusted resolver).
+ */
+export function loadMarketEngineAuthority(): Keypair | null {
+  if (isProductionNodeEnv()) {
+    const raw = process.env.MARKET_ENGINE_AUTHORITY_SECRET?.trim();
+    if (!raw) return null;
+    try {
+      return parseKeypairSecret(raw);
+    } catch {
+      return null;
+    }
+  }
+  return loadEffectiveMarketAuthoritySigner()?.signer ?? null;
+}
+
+/**
+ * SparkUSD faucet / mint signing: optional `SPARK_USD_MINT_AUTHORITY_SECRET`, else {@link loadEffectiveMarketAuthoritySigner}.
+ * In production, falls back only to market engine secret (not trusted resolver).
+ */
+export function loadSparkUsdMintAuthority(): Keypair | null {
+  const mintRaw = process.env.SPARK_USD_MINT_AUTHORITY_SECRET?.trim();
+  if (mintRaw) {
+    try {
+      return parseKeypairSecret(mintRaw);
+    } catch {
+      return null;
+    }
+  }
+  if (isProductionNodeEnv()) {
+    const raw = process.env.MARKET_ENGINE_AUTHORITY_SECRET?.trim();
+    if (!raw) return null;
+    try {
+      return parseKeypairSecret(raw);
+    } catch {
+      return null;
+    }
+  }
+  return loadEffectiveMarketAuthoritySigner()?.signer ?? null;
 }
 
 export function deriveTrustedResolverSecretPublicKey(): string | null {
   const raw = process.env.TRUSTED_RESOLVER_SECRET?.trim();
   if (!raw) return null;
   try {
-    const kp = raw.startsWith("[")
-      ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(raw) as number[]))
-      : Keypair.fromSecretKey(bs58.decode(raw));
-    return kp.publicKey.toBase58();
+    return parseKeypairSecret(raw).publicKey.toBase58();
   } catch {
     if (process.env.NODE_ENV === "development") {
       throw new Error(
@@ -57,12 +134,7 @@ export function loadTrustedResolverSigner(): Keypair | null {
 
   let kp: Keypair;
   try {
-    if (raw.startsWith("[")) {
-      const arr = JSON.parse(raw) as number[];
-      kp = Keypair.fromSecretKey(Uint8Array.from(arr));
-    } else {
-      kp = Keypair.fromSecretKey(bs58.decode(raw));
-    }
+    kp = parseKeypairSecret(raw);
   } catch {
     if (process.env.NODE_ENV === "development") {
       throw new Error(

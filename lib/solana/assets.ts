@@ -1,9 +1,11 @@
 import { PublicKey } from "@solana/web3.js";
 
+import { LEGACY_DEVNET_USDC_COLLATERAL_MINT } from "@/lib/config/spark-usd";
+
 /**
- * Devnet SPL token commonly used as USDC stand-in (6 decimals).
- * https://spl-token-faucet.com — same mint referenced in Solana cookbook examples.
+ * Legacy devnet USDC mint pubkey (historical GAMM/pmAMM collateral).
+ * Prefer {@link getSparkUsdMint} from `@/lib/config/spark-usd` for platform collateral.
  */
-export const DEVNET_USDC_MINT = new PublicKey(
-  "Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr",
+export const LEGACY_DEVNET_USDC_MINT = new PublicKey(
+  LEGACY_DEVNET_USDC_COLLATERAL_MINT,
 );

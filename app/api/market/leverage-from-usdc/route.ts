@@ -14,6 +14,7 @@ import {
   MARKET_RESOLVING_TRADING_ERROR,
 } from "@/lib/market/market-trading-blocked";
 import { loadMarketEngineAuthority } from "@/lib/solana/treasury";
+import { collateralMintFromMarketRecord } from "@/lib/config/spark-usd";
 import { getSupabaseAdmin } from "@/lib/supabase/server-client";
 import type { MarketRecord } from "@/lib/types/market-record";
 
@@ -90,7 +91,7 @@ export async function POST(req: Request) {
     const { data: row, error } = await sb
       .from("markets")
       .select(
-        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address",
+        "slug,status,resolution_status,resolve_after,expiry_ts,yes_mint,no_mint,pool_address,usdc_mint",
       )
       .eq("slug", slug)
       .maybeSingle();
@@ -118,10 +119,12 @@ export async function POST(req: Request) {
       );
     }
 
+    const collateralMint = collateralMintFromMarketRecord(rec.usdc_mint);
+
     const usdcAtoms = parseUsdcHumanToBaseUnits(usdcAmountHuman);
     if (usdcAtoms <= 0n) {
       return NextResponse.json(
-        { error: "Enter a devnet USDC amount greater than zero" },
+        { error: "Enter a SparkUSD amount greater than zero" },
         { status: 400 },
       );
     }
@@ -146,6 +149,7 @@ export async function POST(req: Request) {
         usdcAmountAtoms: usdcAtoms,
         slippageBps,
         leverageSlider01,
+        collateralMint,
       });
 
       const serialized = built.transaction.serialize({
@@ -183,6 +187,7 @@ export async function POST(req: Request) {
       usdcAmountAtoms: usdcAtoms,
       slippageBps,
       leverageSlider01,
+      collateralMint,
     });
 
     const serialized = built.transaction.serialize({

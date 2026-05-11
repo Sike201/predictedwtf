@@ -8,6 +8,7 @@ import {
 import type { MarketEngine } from "@/lib/types/market";
 import { devnetTxExplorerUrl, shortenTransactionSignature } from "@/lib/utils/solana-explorer";
 import { cn } from "@/lib/utils/cn";
+import { COLLATERAL_DISPLAY_LABEL } from "@/lib/config/spark-usd";
 
 type PoolActivityEntry = {
   signature: string;
@@ -174,8 +175,8 @@ export function MarketOrderbookPanel({
       <div className="border-b border-white/[0.06]">
         <div className="grid grid-cols-[minmax(0,0.85fr)_minmax(0,0.75fr)_64px] gap-1 border-b border-white/[0.05] px-0 py-1.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
           <span>Trade</span>
-          <span title={marketEngine === "PM_AMM" ? "USDC notional" : undefined}>
-            {marketEngine === "PM_AMM" ? "Size (USDC)" : "Size"}
+          <span title={marketEngine === "PM_AMM" ? `${COLLATERAL_DISPLAY_LABEL} notional` : undefined}>
+            {marketEngine === "PM_AMM" ? `Size (${COLLATERAL_DISPLAY_LABEL})` : "Size"}
           </span>
           <span className="text-right">Tx</span>
         </div>

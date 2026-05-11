@@ -45,6 +45,8 @@ import { cn } from "@/lib/utils/cn";
 import { MarketOutcomeLeveragePanel } from "@/components/market/market-outcome-leverage-panel";
 import { MarketSellOutcomeButton } from "@/components/market/market-sell-outcome-button";
 import { MarketTradingPrimaryButton } from "@/components/market/market-trading-primary-button";
+import { SparkUsdClaimInline } from "@/components/spark-usd/spark-usd-claim-inline";
+import { COLLATERAL_DISPLAY_LABEL } from "@/lib/config/spark-usd";
 import type { OmnipairUserPositionSnapshot } from "@/lib/hooks/use-omnipair-user-position";
 import type {
   SellOutcomeForUsdcBuildLog,
@@ -85,9 +87,11 @@ function formatWithdrawUsdcReceivedLabel(atoms: string): string {
     const a = BigInt(atoms);
     const whole = a / 1_000_000n;
     const frac = (a % 1_000_000n).toString().padStart(6, "0").replace(/0+$/, "");
-    return frac.length ? `${whole}.${frac} USDC` : `${whole}.0 USDC`;
+    return frac.length
+      ? `${whole}.${frac} ${COLLATERAL_DISPLAY_LABEL}`
+      : `${whole}.0 ${COLLATERAL_DISPLAY_LABEL}`;
   } catch {
-    return "USDC";
+    return COLLATERAL_DISPLAY_LABEL;
   }
 }
 
@@ -920,7 +924,9 @@ export function MarketActionsCard({
         );
       }
       const amountLabel =
-        trimmed === "0" || trimmed === "" ? "USDC" : `${trimmed} USDC`;
+        trimmed === "0" || trimmed === ""
+          ? COLLATERAL_DISPLAY_LABEL
+          : `${trimmed} ${COLLATERAL_DISPLAY_LABEL}`;
       pushRecentMarketTransaction(
         market.id,
         {
@@ -982,14 +988,14 @@ export function MarketActionsCard({
       const receiveNote =
         buildLog?.uiSummary ??
         (BigInt(usdcOutAtoms || "0") > 0n
-          ? `Receive ~${usdcHuman} devnet USDC`
+          ? `Receive ~${usdcHuman} ${COLLATERAL_DISPLAY_LABEL}`
           : "Trade confirmed.");
       const amountSummary =
         buildLog?.routeKind === "fallback_pool_swap"
           ? `${amountLabel} · pool swap`
           : buildLog?.routeKind === "resolved_winner_redeem"
-            ? `${amountLabel} → ${usdcHuman} USDC (settlement)`
-            : `${amountLabel} → ~${usdcHuman} USDC`;
+            ? `${amountLabel} → ${usdcHuman} ${COLLATERAL_DISPLAY_LABEL} (settlement)`
+            : `${amountLabel} → ~${usdcHuman} ${COLLATERAL_DISPLAY_LABEL}`;
       pushRecentMarketTransaction(
         market.id,
         {
@@ -1370,6 +1376,7 @@ export function MarketActionsCard({
     <>
     <div className="rounded-xl bg-[#111] p-4 ring-1 ring-white/[0.06]">
       <h2 className="text-[12px] font-semibold text-zinc-300">Market Actions</h2>
+      <SparkUsdClaimInline />
       {isResolving &&
       (actionTab === "buy" ||
         actionTab === "sell" ||
@@ -1419,7 +1426,7 @@ export function MarketActionsCard({
       {variant === "earn" && actionTab === "deposit" && hasPool ? (
         <div className="mt-5">
           <p className="text-[12px] leading-relaxed text-zinc-500">
-            Add devnet USDC. The protocol mints equal YES+NO and provides both
+            Add {COLLATERAL_DISPLAY_LABEL}. The protocol mints equal YES+NO and provides both
             sides. Network fees apply; the first add may open an LP token
             account.
           </p>
@@ -1429,7 +1436,7 @@ export function MarketActionsCard({
               value={depositAmount}
               onChange={(e) => setDepositAmount(e.target.value)}
               inputMode="decimal"
-              placeholder="0.00 USDC"
+              placeholder={`0.00 ${COLLATERAL_DISPLAY_LABEL}`}
               disabled={anyLocked || isResolved}
               className="min-w-0 flex-1 border-0 bg-transparent text-right text-2xl font-semibold tabular-nums tracking-tight text-white outline-none placeholder:text-zinc-600 sm:text-[1.6rem]"
             />
@@ -1476,11 +1483,11 @@ export function MarketActionsCard({
           ) : (
             <>
               <p className="text-[12px] leading-relaxed text-zinc-500">
-                Withdraw converts your LP position back into USDC. A 1% protocol
+                Withdraw converts your LP position back into {COLLATERAL_DISPLAY_LABEL}. A 1% protocol
                 withdrawal fee remains in the pool.
               </p>
               {withdrawUsdcPlanLoading ? (
-                <p className="mt-2 text-[11px] text-zinc-500">Estimating USDC…</p>
+                <p className="mt-2 text-[11px] text-zinc-500">Estimating {COLLATERAL_DISPLAY_LABEL}…</p>
               ) : null}
               {withdrawUsdcPlanError ? (
                 <p className="mt-2 text-[11px] font-medium text-amber-200/90" role="alert">
@@ -1542,7 +1549,7 @@ export function MarketActionsCard({
             className="mt-3 text-left text-[11px] font-medium text-zinc-400 underline decoration-zinc-600 underline-offset-2 hover:text-zinc-200"
           >
             {withdrawAdvancedRawTokens
-              ? "Use standard USDC withdraw"
+              ? `Use standard ${COLLATERAL_DISPLAY_LABEL} withdraw`
               : "Advanced: Withdraw as YES + NO"}
           </button>
           <div className="mt-4">
@@ -1663,7 +1670,7 @@ export function MarketActionsCard({
                   balances.usdcDecimals,
                   2,
                 )}{" "}
-                USDC
+                {COLLATERAL_DISPLAY_LABEL}
               </p>
             ) : null}
           </div>
@@ -1786,7 +1793,7 @@ export function MarketActionsCard({
                     <div className="space-y-1.5 text-right">
                       {sellPlan.routeKind === "resolved_winner_redeem" ? (
                         <p className="text-[10px] text-zinc-500">
-                          1 USDC per share, custody redemption
+                          1 {COLLATERAL_DISPLAY_LABEL} per share, custody redemption
                         </p>
                       ) : (
                         <p className="text-[10px] text-zinc-500">
@@ -1799,12 +1806,12 @@ export function MarketActionsCard({
                       <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
                         <span className="text-[11px] font-medium tracking-wide text-zinc-500">
                           {sellPlan.routeKind === "resolved_winner_redeem"
-                            ? "Payout (USDC)"
-                            : "Est. USDC (exit route)"}
+                            ? `Payout (${COLLATERAL_DISPLAY_LABEL})`
+                            : `Est. ${COLLATERAL_DISPLAY_LABEL} (exit route)`}
                         </span>
                         {sellPlan.routeKind === "fallback_pool_swap" ? (
                           <div className="text-right text-[10px] text-amber-200/80">
-                            No USDC on this path — {sellPlan.uiSummary}
+                            No {COLLATERAL_DISPLAY_LABEL} on this path — {sellPlan.uiSummary}
                           </div>
                         ) : (
                           <>
@@ -1936,11 +1943,11 @@ export function MarketActionsCard({
                     </p>
                     <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
                       <span className="text-[11px] font-medium tracking-wide text-zinc-500">
-                        Est. USDC (exit route)
+                        Est. {COLLATERAL_DISPLAY_LABEL} (exit route)
                       </span>
                       {sellPlan.routeKind === "fallback_pool_swap" ? (
                         <span className="max-w-full text-right text-[10px] text-amber-200/80">
-                          No USDC — {sellPlan.uiSummary}
+                          No {COLLATERAL_DISPLAY_LABEL} — {sellPlan.uiSummary}
                         </span>
                       ) : (
                         <>
@@ -2009,7 +2016,7 @@ export function MarketActionsCard({
       {variant === "earn" ? (
         <p className="mt-2 max-w-lg px-1 text-[10px] leading-relaxed text-yellow-300 sm:px-2 sm:text-[11px]">
           <span className="font-medium text-yellow-300">Earn (LP):</span> provide YES+NO
-          to the pool (via devnet USDC full-set) and receive LP shares. LPs earn fees
+          to the pool (via {COLLATERAL_DISPLAY_LABEL} full-set) and receive LP shares. LPs earn fees
           from trading activity but are exposed to market outcome risk. APR is an
           estimate, not a promise of return.
         </p>

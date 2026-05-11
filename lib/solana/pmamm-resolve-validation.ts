@@ -107,7 +107,7 @@ export async function validatePmammMarketAccountBeforeResolve(
     try {
       if (!collateral.equals(fetched.collateralMint)) {
         warnings.push(
-          `Collateral mint differs from NEXT_PUBLIC_PMAMM_USDC_MINT (chain=${fetched.collateralMint.toBase58()}, env_collateral_expected=${collateral.toBase58()}).`,
+          `Collateral mint differs from configured SparkUSD mint (chain=${fetched.collateralMint.toBase58()}, env_collateral_expected=${collateral.toBase58()}).`,
         );
       }
     } catch {

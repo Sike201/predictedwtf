@@ -29,6 +29,7 @@ import {
   PMAMM_CONFIG,
   PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN,
 } from "@/lib/solana/pmamm-config";
+import { COLLATERAL_DISPLAY_LABEL } from "@/lib/config/spark-usd";
 import {
   dedupeWinnerDrafts,
   isNoneOfListedOutcomeDraft,
@@ -1304,7 +1305,7 @@ export function CreateMarketFlow() {
                             type="text"
                             inputMode="decimal"
                             autoComplete="off"
-                            placeholder={`${PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN} USDC`}
+                            placeholder={`${PMAMM_DEFAULT_INITIAL_LIQUIDITY_USDC_HUMAN} ${COLLATERAL_DISPLAY_LABEL}`}
                             value={pmammInitialLiquidityUsdc}
                             onChange={(e) =>
                               setPmammInitialLiquidityUsdc(e.target.value)
@@ -1313,7 +1314,7 @@ export function CreateMarketFlow() {
                             className="w-full rounded-lg border border-white/[0.1] bg-black/25 px-3 py-2 text-[13px] text-zinc-100 placeholder:text-zinc-600 focus:border-white/[0.2] focus:outline-none disabled:opacity-45"
                           />
                           <p className="text-[10px] leading-relaxed text-zinc-500">
-                            Recommended: 1000 USDC. You can start smaller for
+                            Recommended: 1000 {COLLATERAL_DISPLAY_LABEL}. You can start smaller for
                             testing.
                           </p>
                           <p className="text-[10px] leading-relaxed text-zinc-500">
@@ -1323,13 +1324,13 @@ export function CreateMarketFlow() {
                           <p className="text-[10px] leading-relaxed text-zinc-600">
                             Initial liquidity is deposited from your connected
                             wallet. After you click create, approve the liquidity
-                            deposit in your wallet — you pay SOL fees and USDC,
+                            deposit in your wallet — you pay SOL fees and {COLLATERAL_DISPLAY_LABEL},
                             and you receive the LP position.
                           </p>
                           {yourPmammUsdcLoading ? (
                             <p className="flex items-center gap-2 text-[10px] text-zinc-500">
                               <Loader2 className="h-3 w-3 animate-spin" />
-                              Loading your USDC balance…
+                              Loading your {COLLATERAL_DISPLAY_LABEL} balance…
                             </p>
                           ) : yourPmammUsdcAtoms !== null && pmammLiqParsed.ok ? (
                             <p className="text-[10px] leading-relaxed text-zinc-500">
@@ -1338,7 +1339,7 @@ export function CreateMarketFlow() {
                                 yourPmammUsdcAtoms,
                                 PMAMM_USDC_DECIMALS,
                               )}{" "}
-                              USDC (mint{" "}
+                              {COLLATERAL_DISPLAY_LABEL} (mint{" "}
                               <span className="font-mono text-zinc-600">
                                 {PMAMM_CONFIG.collateralMint.toBase58().slice(0, 6)}
                                 …
@@ -1358,12 +1359,12 @@ export function CreateMarketFlow() {
                                 pmammLiqParsed.atoms,
                                 PMAMM_USDC_DECIMALS,
                               )}{" "}
-                              USDC, but your wallet has{" "}
+                              {COLLATERAL_DISPLAY_LABEL}, but your wallet has{" "}
                               {formatPmammCollateralHuman(
                                 yourPmammUsdcAtoms!,
                                 PMAMM_USDC_DECIMALS,
                               )}{" "}
-                              USDC.
+                              {COLLATERAL_DISPLAY_LABEL}.
                             </p>
                           ) : null}
                         </div>
